@@ -2,6 +2,10 @@
 __pycache__/
 *.py[codz]
 *$py.class
+*.pyc
+*.duckdb
+.ipynb_checkpoints/
+*.wal
 
 # C extensions
 *.so
