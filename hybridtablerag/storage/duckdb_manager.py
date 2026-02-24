@@ -92,3 +92,82 @@ class DuckDBManager:
             print("[DuckDB] Connection closed.")
         except Exception:
             pass
+
+    def infer_relationships(self):
+        """
+        Infer potential relationships between tables
+        based on matching column names and data types.
+        Returns a structured relationship graph.
+        """
+        try:
+            schema_overview = self.get_database_schema_overview()
+            tables = list(schema_overview.keys())
+
+            relationships = {}
+
+            for table_a in tables:
+                relationships[table_a] = []
+
+                columns_a = schema_overview[table_a]["columns"]
+
+                for table_b in tables:
+                    if table_a == table_b:
+                        continue
+
+                    columns_b = schema_overview[table_b]["columns"]
+
+                    for col_a in columns_a:
+                        for col_b in columns_b:
+                            if (
+                                col_a["column_name"] == col_b["column_name"]
+                                and col_a["data_type"] == col_b["data_type"]
+                            ):
+                                relationships[table_a].append({
+                                    "from_column": col_a["column_name"],
+                                    "to_table": table_b,
+                                    "to_column": col_b["column_name"],
+                                    "data_type": col_a["data_type"]
+                                })
+
+            return relationships
+
+        except Exception as e:
+            raise RuntimeError(f"[DuckDB] Relationship inference failed: {e}")
+        
+
+    def suggest_joins(self, tables):
+        """
+        Suggest JOIN conditions between provided tables
+        based on inferred relationships.
+        """
+        try:
+            if not tables or len(tables) < 2:
+                return []
+
+            relationships = self.infer_relationships()
+            joins = []
+
+            for table in tables:
+                if table not in relationships:
+                    continue
+
+                for rel in relationships[table]:
+                    if rel["to_table"] in tables:
+                        condition = (
+                            f"{table}.{rel['from_column']} = "
+                            f"{rel['to_table']}.{rel['to_column']}"
+                        )
+
+                        # Avoid duplicate reversed joins
+                        reverse_condition = (
+                            f"{rel['to_table']}.{rel['to_column']} = "
+                            f"{table}.{rel['from_column']}"
+                        )
+
+                        if condition not in joins and reverse_condition not in joins:
+                            joins.append(condition)
+
+            return joins
+
+        except Exception as e:
+            raise RuntimeError(f"[DuckDB] Join suggestion failed: {e}")
