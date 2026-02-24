@@ -1,0 +1,7 @@
+duckdb
+pandas
+openpyxl
+ollama
+google.genai
+openai
+python-dotenv
