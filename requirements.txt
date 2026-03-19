@@ -3,5 +3,5 @@ pandas
 openpyxl
 openai
 python-dotenv
-faiss-cpu
 plotly
+streamlit
