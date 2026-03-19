@@ -220,7 +220,7 @@ def clean_dataframe(
       5. Drop duplicate rows
       6. Flatten JSON columns (row-aligned, handles nested dicts)
       7. Parse & normalise date columns (element-wise, handles mixed formats)
-      8. Infer numeric columns
+      8. Infer numeric columns (If most values in this column look like numbers, convert the whole column to numeric. If something doesn’t convert, turn it into NaN and log what happened)
 
     Returns (cleaned_df, log).
     """

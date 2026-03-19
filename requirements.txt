@@ -1,9 +1,7 @@
 duckdb
 pandas
 openpyxl
-ollama
-google.genai
 openai
 python-dotenv
-faiss
-sentence_transformers
+faiss-cpu
+plotly
