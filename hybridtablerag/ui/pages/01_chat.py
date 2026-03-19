@@ -26,7 +26,7 @@ from hybridtablerag.reasoning.query_orchestrator import QueryResult
 # ──────────────────────────────────────────────────────────────────────────────
 # Page config
 # ──────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Chat — Hybrid Table RAG", layout="wide", page_icon="💬")
+st.set_page_config(page_title="Chat — Hybrid Table RAG", layout="wide", page_icon="")
 
 st.markdown("""
 <style>
@@ -208,10 +208,10 @@ if "chat_messages" not in st.session_state:
 
 def _log_class(line: str) -> str:
     l = line.lower()
-    if any(k in l for k in ("dropped", "error", "❌")):  return "ll-drop"
-    if any(k in l for k in ("normalised", "✅", "complete")): return "ll-ok"
+    if any(k in l for k in ("dropped", "error")):  return "ll-drop"
+    if any(k in l for k in ("normalised", "complete")): return "ll-ok"
     if any(k in l for k in ("flattened", "intent", "routed")): return "ll-flat"
-    if any(k in l for k in ("numeric", "warn", "⚠️")):   return "ll-warn"
+    if any(k in l for k in ("numeric", "warn")):   return "ll-warn"
     return "ll-dim"
 
 
@@ -233,16 +233,16 @@ def _summary_text(result: QueryResult) -> str:
     return "Done."
 
 
-def _render_reasoning_panel(result: QueryResult):
+def _render_reasoning_panel(result: QueryResult, uid: str = ''):
     """The expandable 'How did I get this?' panel under each AI bubble."""
-    with st.expander("🔍 How did I get this?", expanded=False):
+    with st.expander("How did I get this?", expanded=False):
         tab_labels = ["Result", "SQL / Code", "Reasoning", "Execution log"]
         tabs = st.tabs(tab_labels)
 
         # Tab 0 — full dataframe
         with tabs[0]:
             if result.chart is not None:
-                st.plotly_chart(result.chart, use_container_width=True)
+                st.plotly_chart(result.chart, use_container_width=True, key=f'chart_panel_{uid}')
             if result.dataframe is not None and not result.dataframe.empty:
                 st.dataframe(result.dataframe, use_container_width=True)
             elif result.dataframe is not None:
@@ -280,7 +280,7 @@ def _render_reasoning_panel(result: QueryResult):
 
 
 def _render_message(msg: dict, idx: int):
-    """Render one chat turn."""
+    """Render one chat turn — user, single AI, or dual SQL+Python AI."""
     role = msg["role"]
 
     if role == "user":
@@ -292,10 +292,78 @@ def _render_message(msg: dict, idx: int):
             unsafe_allow_html=True,
         )
 
-    else:  # ai
+    elif role == "ai_dual":
+        # ── Both SQL + Python results side by side ────────────────────────
+        result_sql: QueryResult = msg["result_sql"]
+        result_py:  QueryResult = msg["result_py"]
+
+        # Single AI bubble summarising both
+        sql_rows = len(result_sql.dataframe) if result_sql.dataframe is not None else 0
+        has_chart = result_py.chart is not None
+        summary = (
+            f"SQL returned {sql_rows} rows · "
+            f"Python {'generated a chart' if has_chart else 'computed analysis'}"
+        )
+        st.markdown(
+            f"<div class='bubble-wrap ai'>"
+            f"  <div class='avatar ai'>AI</div>"
+            f"  <div class='bubble ai'>"
+            f"    <span class='intent-badge intent-sql'>SQL</span>&nbsp;"
+            f"    <span class='intent-badge intent-python'>PYTHON</span><br>"
+            f"    {summary}"
+            f"  </div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        # Side-by-side panels
+        col_sql, col_py = st.columns(2)
+
+        with col_sql:
+            st.markdown("##### SQL answer")
+            if not result_sql.success:
+                st.error(result_sql.error)
+            else:
+                if result_sql.dataframe is not None and not result_sql.dataframe.empty:
+                    st.dataframe(result_sql.dataframe, use_container_width=True)
+                else:
+                    st.info("No rows returned.")
+            with st.expander("SQL · How did I get this?", expanded=False):
+                tabs = st.tabs(["SQL", "Reasoning", "Log"])
+                with tabs[0]:
+                    if result_sql.sql:
+                        st.code(result_sql.sql, language="sql")
+                with tabs[1]:
+                    if result_sql.reasoning:
+                        st.markdown(result_sql.reasoning)
+                    else:
+                        st.caption("Enable Reasoning mode to see chain-of-thought.")
+                with tabs[2]:
+                    _render_log_mini(result_sql.bts_log)
+
+        with col_py:
+            st.markdown("##### Python analysis")
+            if not result_py.success:
+                st.error(result_py.error)
+            else:
+                if result_py.chart is not None:
+                    st.plotly_chart(result_py.chart, use_container_width=True, key=f'chart_dual_{idx}')
+                if result_py.dataframe is not None and not result_py.dataframe.empty:
+                    st.dataframe(result_py.dataframe, use_container_width=True)
+                elif result_py.chart is None:
+                    st.info("No output produced.")
+            with st.expander("Python · How did I get this?", expanded=False):
+                tabs = st.tabs(["Code", "Log"])
+                with tabs[0]:
+                    if result_py.sql:
+                        code_block = result_py.sql.replace("-- Python path (SQL pre-filter + pandas/plotly)\n", "")
+                        st.code(code_block, language="python")
+                with tabs[1]:
+                    _render_log_mini(result_py.bts_log)
+
+    else:  # single ai result
         result: QueryResult = msg["result"]
 
-        # Intent badge
         if not result.success:
             badge = "<span class='intent-badge intent-err'>ERROR</span>"
         elif result.intent == "sql":
@@ -316,7 +384,7 @@ def _render_message(msg: dict, idx: int):
         )
 
         # Reasoning panel lives outside the bubble (full-width)
-        _render_reasoning_panel(result)
+        _render_reasoning_panel(result, uid=str(idx))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -324,7 +392,7 @@ def _render_message(msg: dict, idx: int):
 # ──────────────────────────────────────────────────────────────────────────────
 st.markdown(
     "<div class='chat-header'>"
-    "<h1>💬 Chat with your data</h1>"
+    "<h1>Chat with your data</h1>"
     "<p>Ask anything about your loaded table in plain English.</p>"
     "</div>",
     unsafe_allow_html=True,
@@ -356,12 +424,12 @@ with col_info:
     if cleaned is not None:
         df_ref = cleaned if isinstance(cleaned, pd.DataFrame) else list(cleaned.values())[0]
         r, c = df_ref.shape
-        st.caption(f"📊 Active table: **{table_name}** — {r} rows × {c} columns")
+        st.caption(f"Active table: **{table_name}** — {r} rows × {c} columns")
     else:
-        st.caption(f"📊 Active table: **{table_name}**")
+        st.caption(f"Active table: **{table_name}**")
 
 with col_clear:
-    if st.button("🗑 Clear chat", use_container_width=True):
+    if st.button("Clear chat", use_container_width=True):
         st.session_state.chat_messages = []
         st.rerun()
 
@@ -393,12 +461,12 @@ col_input, col_send = st.columns([5, 1])
 with col_input:
     user_input = st.text_input(
         "user_input",
-        placeholder='e.g. "How many tickets are high priority?" or "Plot tickets by department"',
+        placeholder='e.g. "What is the correlation between priority and resolution time?" or "Plot ticket trends"',
         label_visibility="collapsed",
         key="chat_input",
     )
 with col_send:
-    send = st.button("Send ▶", use_container_width=True, type="primary")
+    send = st.button("Send", use_container_width=True, type="primary")
 
 # Options row
 col_r, col_p, _ = st.columns([1, 1, 3])
@@ -406,8 +474,15 @@ with col_r:
     reasoning_mode = st.checkbox("Reasoning mode", value=False,
         help="Ask the LLM to explain its SQL derivation step by step")
 with col_p:
-    force_path = st.selectbox("Path", ["auto", "sql", "python"],
-        help="Force SQL or Python execution, or let the router decide")
+    force_path = st.selectbox(
+        "Path",
+        ["auto (sql + python)", "sql only", "python only"],
+        help=(
+            "auto — runs both SQL and Python, shows answers side by side\n"
+            "sql only — structured queries, counts, filters\n"
+            "python only — analytics, stats, numpy, charts"
+        ),
+    )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Handle submission
@@ -415,19 +490,31 @@ with col_p:
 if send and user_input.strip():
     query = user_input.strip()
 
-    # Append user message
     st.session_state.chat_messages.append({"role": "user", "text": query})
 
-    # Run orchestrator
-    with st.spinner("Thinking…"):
-        result = orchestrator.run(
-            query,
-            reasoning=reasoning_mode,
-            force_intent=None if force_path == "auto" else force_path,
-        )
+    auto_mode = force_path.startswith("auto")
 
-    # Append AI message
-    st.session_state.chat_messages.append({"role": "ai", "result": result})
+    if auto_mode:
+        # Run both paths — show SQL and Python side by side
+        with st.spinner("Running SQL + Python analysis…"):
+            result_sql = orchestrator.run(
+                query, reasoning=reasoning_mode, force_intent="sql"
+            )
+            result_py = orchestrator.run(
+                query, reasoning=reasoning_mode, force_intent="python"
+            )
+        st.session_state.chat_messages.append({
+            "role":       "ai_dual",
+            "result_sql": result_sql,
+            "result_py":  result_py,
+        })
 
-    # Rerun so the new messages render in the chat container above
+    else:
+        intent = "sql" if force_path.startswith("sql") else "python"
+        with st.spinner(f"Running {intent} path…"):
+            result = orchestrator.run(
+                query, reasoning=reasoning_mode, force_intent=intent
+            )
+        st.session_state.chat_messages.append({"role": "ai", "result": result})
+
     st.rerun()
