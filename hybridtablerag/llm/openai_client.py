@@ -11,7 +11,7 @@ class OpenAIClient(BaseLLM):
         api_key = os.getenv("OPENAI_API_KEY")
 
         if not api_key:
-            raise ValueError("GEMINI_API_KEY not found. Check your .env file.")
+            raise ValueError("OPENAI_API_KEY not found. Check your .env file.")
         
         self.client = OpenAI(api_key=api_key)
         self.model_name = model_name

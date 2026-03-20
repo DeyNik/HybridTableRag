@@ -3,7 +3,7 @@ from hybridtablerag.llm.base import BaseLLM
 
 class OllamaClient(BaseLLM):
 
-    def __init__(self, model_name: str = "qwen2.5:14b"):
+    def __init__(self, model_name: str = "qwen3:8b"):
         self.model_name = model_name
 
     def generate(self, prompt: str) -> str:

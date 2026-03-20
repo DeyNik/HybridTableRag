@@ -30,10 +30,10 @@ from hybridtablerag.reasoning.query_orchestrator import (
     register_cleaned_df,
 )
 
-# from hybridtablerag.llm.gemini_client  import GeminiClient  as LLMClient
-# from llm.ollama_client  import OllamaClient  as LLMClient
+from hybridtablerag.llm.gemini_client  import GeminiClient  as LLMClient
+#from hybridtablerag.llm.ollama_client  import OllamaClient  as LLMClient
 # from llm.openai_client  import OpenAIClient  as LLMClient
-from hybridtablerag.llm.azureopenai_client  import AzureOpenAIClient  as LLMClient
+# from hybridtablerag.llm.azureopenai_client  import AzureOpenAIClient  as LLMClient
 
 
 #css config
@@ -367,7 +367,7 @@ else:
             )
             register_cleaned_df(db.conn, df_to_load, table_name_input, bts)
 
-            llm         = get_llm("azure-openai", "charlie-gpt-4.1-mini")          
+            llm         = get_llm("gemini", "gemini-2.5-flash")          #  get_llm("ollama", "qwen3:8b") 
             sql_gen     = LLMSQLGenerator(llm=llm)
             orchestrator = QueryOrchestrator(
                 llm=llm,
