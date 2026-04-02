@@ -1,478 +1,352 @@
-# streamlit_app.py
-import sys
-import io
-from pathlib import Path
-import os
-import pandas as pd
-import streamlit as st
-
-# Add project root to Python path
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-sys.path.insert(0, project_root)
-#sys.path.append(str(Path(__file__).resolve().parent.parent))
 """
 ui/streamlit_app.py
 ====================
-Full Streamlit UI:
-  Upload CSV / Excel
-  Clean & Profile  (metadata/schema_profiler.py)
-  Load into DuckDB (storage/duckdb_manager.py)
-  Natural language query  (reasoning/query_orchestrator.py)
-  Download cleaned data
+Pipeline page: Upload → Clean → Normalize → Load → Download
+Calls the FastAPI backend at API_BASE_URL.
+Can also run in standalone mode (direct Python imports) when API is unavailable.
 """
-from hybridtablerag.llm.factory import get_llm
-from hybridtablerag.reasoning.sql_generator import LLMSQLGenerator
-from hybridtablerag.storage.duckdb_manager import DuckDBManager
-from hybridtablerag.metadata.schema_profiler import clean_and_profile
-from hybridtablerag.reasoning.query_orchestrator import (
-    QueryOrchestrator,
-    QueryResult,
-    register_cleaned_df,
-)
 
-# from hybridtablerag.llm.gemini_client  import GeminiClient  as LLMClient
-# from llm.ollama_client  import OllamaClient  as LLMClient
-# from llm.openai_client  import OpenAIClient  as LLMClient
-from hybridtablerag.llm.azureopenai_client  import AzureOpenAIClient  as LLMClient
+import io
+import os
+import sys
+import uuid
+from pathlib import Path
 
-
-#css config
-st.set_page_config(page_title="Hybrid Table RAG", layout="wide")
+import pandas as pd
+import requests
 import streamlit as st
+
+# ── Path setup ────────────────────────────────────────────────────────────────
+_root = str(Path(__file__).resolve().parent.parent.parent)
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+
+API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
+
+# ── Page config ───────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="HybridTableRAG",
+    layout="wide",
+    page_icon="🧬",
+    initial_sidebar_state="expanded",
+)
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&display=swap');
-
-:root {
-  --bg:#ffffff; --surface:#f5f5f5; --border:#cccccc;
-  --ok:#34d399; --warn:#f59e0b; --err:#f87171;
-  --text:#111111; --muted:#555555;
-}
-
-html, body, [data-testid="stAppViewContainer"] {
-  background: var(--bg) !important;
-  color: var(--text) !important;
-  font-family: 'IBM Plex Mono', monospace;
-}
-
-[data-testid="stSidebar"] {
-  background: var(--surface) !important;
-  color: var(--text) !important;
-}
-
-h1, h2, h3 {
-  color: var(--text) !important;
-  font-weight: 600;
-  font-family: 'IBM Plex Mono', monospace;
-}
-
-.stat-row {
-  display:flex; gap:.6rem; flex-wrap:wrap; margin:.6rem 0;
-}
-
-.stat-pill {
-  background:#e0e0e0; 
-  border:1px solid var(--border);
-  border-radius:6px; padding:.25rem .7rem; 
-  font-size:.75rem; color:var(--muted);
-}
-
-.stat-pill span {
-  color:var(--text); font-weight:700; margin-left:.3rem;
-}
-
-.log-block {
-  background:#f0f0f0; border:1px solid var(--border); 
-  border-radius:8px; padding:1rem; max-height:320px; 
-  overflow-y:auto; font-size:.78rem; line-height:1.7;
-}
-
-.log-drop { color: var(--err); } 
-.log-norm { color: var(--ok); }
-.log-flat { color: var(--muted); } 
-.log-num { color: var(--warn); }
-.log-default { color: var(--muted); }
-
-.stButton > button {
-  background:#888888; 
-  color:#fff; 
-  border:none; 
-  border-radius:8px;
-  font-family:'IBM Plex Mono', monospace; font-weight:600;
-  padding:.5rem 1.4rem; letter-spacing:.02em; transition:opacity .2s;
-}
-
-.stButton > button:hover { opacity:.85; }
-
-[data-testid="stFileUploader"] {
-  border:2px dashed var(--border) !important; 
-  border-radius:10px !important; 
-  background: var(--surface) !important;
-}
-
-[data-testid="stDataFrame"] {
-  border:1px solid var(--border) !important; 
-  border-radius:8px; 
-  background: var(--bg) !important;
-}
-
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+:root{--bg:#ffffff;--surface:#f7f8fa;--border:#e2e6ea;--accent:#2563eb;
+     --ok:#16a34a;--warn:#b45309;--err:#dc2626;--text:#0f172a;--muted:#64748b;}
+html,body,[data-testid="stAppViewContainer"]{background:var(--bg)!important;
+  color:var(--text)!important;font-family:'IBM Plex Sans',sans-serif;}
+[data-testid="stSidebar"]{background:var(--surface)!important;border-right:1px solid var(--border);}
+h1,h2,h3{font-family:'IBM Plex Mono',monospace;letter-spacing:-.02em;}
+.step-header{font-family:'IBM Plex Mono',monospace;font-size:.85rem;font-weight:600;
+  color:var(--accent);text-transform:uppercase;letter-spacing:.08em;margin-bottom:.4rem;}
+.stat-row{display:flex;gap:.5rem;flex-wrap:wrap;margin:.5rem 0;}
+.stat-pill{background:var(--surface);border:1px solid var(--border);border-radius:6px;
+  padding:.2rem .65rem;font-size:.72rem;color:var(--muted);}
+.stat-pill span{color:var(--text);font-weight:600;margin-left:.25rem;}
+.log-wrap{background:#f8f9fb;border:1px solid var(--border);border-left:3px solid var(--accent);
+  border-radius:0 6px 6px 0;padding:.75rem 1rem;max-height:260px;overflow-y:auto;
+  font-family:'IBM Plex Mono',monospace;font-size:.73rem;line-height:1.7;}
+.log-drop{color:var(--err);}.log-ok{color:var(--ok);}.log-warn{color:var(--warn);}.log-dim{color:var(--muted);}
+.bridge-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;
+  padding:.75rem 1rem;margin:.4rem 0;}
+.bridge-card .name{font-family:'IBM Plex Mono',monospace;font-weight:600;font-size:.85rem;}
+.bridge-card .meta{color:var(--muted);font-size:.75rem;}
+.status-ok{color:var(--ok);font-weight:600;}.status-err{color:var(--err);font-weight:600;}
+.stButton>button{background:var(--accent);color:#fff;border:none;border-radius:6px;
+  font-family:'IBM Plex Mono',monospace;font-weight:600;padding:.45rem 1.2rem;}
+.stButton>button:hover{opacity:.88;}
+[data-testid="stDataFrame"]{border:1px solid var(--border)!important;border-radius:6px;}
 </style>
 """, unsafe_allow_html=True)
 
-# Session state defaults
+# ── Session state defaults ────────────────────────────────────────────────────
 _DEFAULTS = {
-    "uploaded_df": None,
-    "cleaned_df":  None,
-    "profile":     None,
-    "log":         None,
-    "db":          None,
-    "orchestrator": None,
-    "table_name":  None,
-    "query_history": [],
+    "session_id":     None,
+    "ingest_result":  None,
+    "uploaded_bytes": None,
+    "uploaded_name":  None,
 }
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 
-# Helpers
-def _resolve_single(obj: dict, key: str):
-    """
-    Session state stores profiles/logs/cleaned_dfs as either:
-      A) single-sheet: the object itself   e.g. {"columns": {...}}  or  [log lines]
-      B) multi-sheet:  {"sheet1": obj, "sheet2": obj}
+# Generate persistent session ID
+if not st.session_state.session_id:
+    st.session_state.session_id = str(uuid.uuid4())[:8]
 
-    For dicts, distinguish by checking for a known top-level key that only
-    exists in the real object (not in the sheet wrapper).
-    For lists (logs), they are never wrapped — always returned directly.
-    """
-    if isinstance(obj, list):
-        return obj                      # logs are always plain lists
-    if key in obj:
-        return obj                      # already the real object (single-sheet)
-    return list(obj.values())[0]        # multi-sheet wrapper — return first sheet
-
-
-def _css_log(line: str) -> str:
-    l = line.lower()
-    if "dropped" in l:     return "log-drop"
-    if "normalised" in l:  return "log-norm"
-    if "flattened" in l:   return "log-flat"
-    if "numeric" in l:     return "log-num"
-    return "log-default"
-
-
-def _render_log(log: list):
-    lines = "".join(
-        f"<div class='{_css_log(l)}'> {l}</div>" for l in log
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### ⚙️ Settings")
+    st.session_state["debug_mode"] = st.checkbox(
+        "🐛 Debug mode",
+        value=st.session_state.get("debug_mode", False),
+        help="Show BTS logs, SQL, and intent classification in all views",
     )
-    st.markdown(f"<div class='log-block'>{lines}</div>", unsafe_allow_html=True)
+    st.caption(f"Session: `{st.session_state.session_id}`")
+    st.divider()
+
+    # API health indicator
+    st.markdown("**API Status**")
+    try:
+        h = requests.get(f"{API_BASE}/health/", timeout=2).json()
+        status_color = "🟢" if h["status"] == "ok" else "🟡"
+        st.markdown(f"{status_color} `{h['status'].upper()}`")
+        st.caption(f"DuckDB: {'✅' if h['duckdb'] else '❌'}  LLM: {'✅' if h['llm'] else '❌'}  Vector: {'✅' if h['vector_store'] else '❌'}")
+        if h["tables"]:
+            st.caption(f"Tables: {', '.join(h['tables'])}")
+    except Exception:
+        st.markdown("🔴 `OFFLINE`")
+        st.caption(f"API not reachable at {API_BASE}")
 
 
-def _stat_pills(**kwargs) -> str:
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _pills(**kwargs) -> str:
     pills = "".join(
         f"<div class='stat-pill'>{k}<span>{v}</span></div>"
         for k, v in kwargs.items()
     )
     return f"<div class='stat-row'>{pills}</div>"
 
+def _log_class(line: str) -> str:
+    l = line.lower()
+    if any(k in l for k in ("dropped", "error", "❌", "failed")): return "log-drop"
+    if any(k in l for k in ("normalised", "✅", "complete", "registered")): return "log-ok"
+    if any(k in l for k in ("warn", "⚠️", "skipped")): return "log-warn"
+    return "log-dim"
 
-def _render_query_result(result: QueryResult):
-    """Render a QueryResult — dataframe, chart, SQL/code, BTS log."""
-    if not result.success:
-        st.error(f"{result.error}")
-    else:
-        badge = "SQL" if result.intent == "sql" else "Python"
-        st.markdown(
-            _stat_pills(intent=badge, rows=len(result.dataframe) if result.dataframe is not None else 0),
-            unsafe_allow_html=True,
-        )
-
-        if result.reasoning:
-            with st.expander("Reasoning", expanded=False):
-                st.markdown(result.reasoning)
-
-        if result.chart is not None:
-            st.plotly_chart(result.chart, use_container_width=True)
-
-        if result.dataframe is not None and not result.dataframe.empty:
-            st.dataframe(result.dataframe, use_container_width=True)
-        elif result.dataframe is not None:
-            st.info("Query returned no rows.")
-
-        if result.sql:
-            with st.expander("SQL / Code", expanded=False):
-                lang = "sql" if result.intent == "sql" else "python"
-                st.code(result.sql, language=lang)
-
-    with st.expander("Behind-the-scenes log", expanded=False):
-        _render_log(result.bts_log)
+def _render_log(log: list):
+    html = "".join(f"<div class='{_log_class(l)}'>› {l}</div>" for l in log)
+    st.markdown(f"<div class='log-wrap'>{html}</div>", unsafe_allow_html=True)
 
 
-
-#Upload
-
-st.title("Hybrid Table RAG")
-st.markdown(
-    "<p style='color:#8892a4;font-size:.9rem;margin-top:-.5rem'>"
-    "Upload → Clean → Query with natural language</p>",
-    unsafe_allow_html=True,
-)
+# ── Header ────────────────────────────────────────────────────────────────────
+st.title("HybridTableRAG")
+st.caption("Upload → Clean → Normalize → Query  |  Switch to **Chat** in the sidebar")
 st.divider()
 
-st.subheader("Upload file")
 
-col_up, col_hdr = st.columns([3, 1])
-with col_hdr:
-    header_rows = st.number_input(
-        "Header rows", min_value=1, max_value=4, value=1,
-        help="Set to 2 for CSVs with a two-row group header (e.g. Ticket / Ticket ID)",
-    )
-with col_up:
-    uploaded_file = st.file_uploader(
-        "CSV or Excel", type=["csv", "xlsx"], label_visibility="collapsed"
+# ── ① Upload ──────────────────────────────────────────────────────────────────
+st.markdown("<div class='step-header'>① Upload file</div>", unsafe_allow_html=True)
+
+col_file, col_opts = st.columns([3, 2])
+
+with col_opts:
+    table_name = st.text_input("Table name", value="tickets",
+        help="Used in DuckDB and SQL queries")
+    normalize = st.checkbox("Auto-normalize multi-valued columns", value=True,
+        help="Detects semicolon/pipe-separated columns and JSON arrays → bridge tables")
+    header_override = st.text_input("Header rows (blank = auto-detect)",
+        value="", placeholder="e.g. 0,1  for two-row header")
+
+with col_file:
+    uploaded = st.file_uploader(
+        "Drop a CSV or Excel file",
+        type=["csv", "xlsx", "xls"],
+        label_visibility="collapsed",
     )
 
-if uploaded_file:
+if uploaded:
+    content = uploaded.read()
+    st.session_state.uploaded_bytes = content
+    st.session_state.uploaded_name  = uploaded.name
+    # Preview
     try:
-        hdr = list(range(header_rows)) if header_rows > 1 else 0
-        if uploaded_file.name.endswith(".csv"):
-            st.session_state.uploaded_df = pd.read_csv(uploaded_file, header=hdr)
+        if uploaded.name.lower().endswith(".csv"):
+            preview_df = pd.read_csv(io.BytesIO(content), nrows=5)
+
         else:
-            sheets = pd.read_excel(uploaded_file, sheet_name=None, header=hdr)
-            st.session_state.uploaded_df = sheets
+            xls = pd.ExcelFile(io.BytesIO(content))
+            sheet_names = xls.sheet_names
+
+            selected_sheet = st.selectbox("Select sheet", sheet_names)
+
+            preview_df = pd.read_excel(
+                io.BytesIO(content),
+                sheet_name=selected_sheet,
+                nrows=5
+            )
+
+        st.markdown(_pills(file=uploaded.name, size=f"{len(content)//1024}KB"), unsafe_allow_html=True)
+
+        with st.expander("▸ Raw preview (first 5 rows)", expanded=True):
+            st.dataframe(preview_df, use_container_width=True)
+
     except Exception as e:
-        st.error(f"Could not read file: {e}")
-
-if st.session_state.uploaded_df is not None:
-    df_map = (
-        st.session_state.uploaded_df
-        if isinstance(st.session_state.uploaded_df, dict)
-        else {"sheet": st.session_state.uploaded_df}
-    )
-    with st.expander("Raw preview", expanded=True):
-        sel = st.selectbox("Sheet", list(df_map.keys())) if len(df_map) > 1 else list(df_map.keys())[0]
-        raw = df_map[sel]
-        if isinstance(raw.columns, pd.MultiIndex):
-            disp = raw.copy()
-            disp.columns = [" ".join(str(i) for i in c if str(i) != "") for c in disp.columns]
-        else:
-            disp = raw
-        st.markdown(_stat_pills(rows=raw.shape[0], cols=raw.shape[1]), unsafe_allow_html=True)
-        st.dataframe(disp.head(10), use_container_width=True)
+        st.warning(f"Could not preview: {e}")
 
 st.divider()
 
 
+# ── ② Ingest (Clean + Normalize + Load) ──────────────────────────────────────
+st.markdown("<div class='step-header'>② Clean · Normalize · Load</div>", unsafe_allow_html=True)
 
-#Clean & Profile
-
-st.subheader("Clean & Profile")
-
-if st.session_state.uploaded_df is None:
-    st.info("Upload a file above to enable cleaning.")
+if st.session_state.uploaded_bytes is None:
+    st.info("Upload a file above to continue.")
 else:
-    if st.button("Run Cleaner"):
-        df_map = (
-            st.session_state.uploaded_df
-            if isinstance(st.session_state.uploaded_df, dict)
-            else {"sheet": st.session_state.uploaded_df}
-        )
-        cleaned_map, profile_map, log_map = {}, {}, {}
-        prog = st.progress(0, text="Cleaning…")
-        for i, (sheet, sdf) in enumerate(df_map.items()):
-            prog.progress((i + 1) / len(df_map), text=f"Cleaning: {sheet}")
+    if st.button("🚀 Run Pipeline", type="primary"):
+        with st.spinner("Running full pipeline…"):
             try:
-                res = clean_and_profile(sdf)
-                cleaned_map[sheet] = res["cleaned_df"]
-                profile_map[sheet] = res["profile"]
-                log_map[sheet]     = res["log"]
+                files   = {"file": (st.session_state.uploaded_name, io.BytesIO(st.session_state.uploaded_bytes))}
+                data    = {
+                    "table_name":  table_name,
+                    "normalize":   str(normalize).lower(),
+                    "header_rows": header_override.strip() or "",
+                }
+                resp = requests.post(f"{API_BASE}/ingest/", files=files, data=data, timeout=120)
+                result = resp.json()
+                st.session_state.ingest_result = result
             except Exception as e:
-                st.error(f"Error on '{sheet}': {e}")
-        prog.empty()
+                st.error(f"API call failed: {e}")
+                st.stop()
 
-        if list(cleaned_map.keys()) == ["sheet"]:
-            st.session_state.cleaned_df = cleaned_map["sheet"]
-            st.session_state.profile    = profile_map["sheet"]
-            st.session_state.log        = log_map["sheet"]
+    if st.session_state.ingest_result:
+        r = st.session_state.ingest_result
+
+        if not r["success"]:
+            st.error(f"Pipeline failed: {r.get('error', 'Unknown error')}")
         else:
-            st.session_state.cleaned_df = cleaned_map
-            st.session_state.profile    = profile_map
-            st.session_state.log        = log_map
-
-        # Reset DuckDB + orchestrator so they pick up fresh cleaned data
-        st.session_state.db           = None
-        st.session_state.orchestrator = None
-        st.session_state.table_name   = None
-        st.success("Cleaning complete!")
-
-if st.session_state.cleaned_df is not None:
-    with st.expander("Cleaned data preview", expanded=False):
-        cdf = (
-            st.session_state.cleaned_df
-            if isinstance(st.session_state.cleaned_df, pd.DataFrame)
-            else list(st.session_state.cleaned_df.values())[0]
-        )
-        st.markdown(_stat_pills(rows=cdf.shape[0], cols=cdf.shape[1]), unsafe_allow_html=True)
-        st.dataframe(cdf, use_container_width=True)
-
-    with st.expander("Cleaning log", expanded=False):
-        log = _resolve_single(st.session_state.log, None)
-        _render_log(log)
-
-    with st.expander("Column profile", expanded=False):
-        profile = _resolve_single(st.session_state.profile, "columns")
-        rows = []
-        for col, stats in profile["columns"].items():
-            pct = stats["pct_null"]
-            rows.append({
-                "column":   col,
-                "dtype":    stats["dtype"],
-                "nulls":    stats["num_nulls"],
-                "% null":   f"{pct:.1f}",
-                "unique":   stats["num_unique"],
-                "samples":  " | ".join(str(v) for v in stats["sample_values"][:3]),
-            })
-        st.dataframe(pd.DataFrame(rows).set_index("column"), use_container_width=True)
-
-st.divider()
-
-
-# Load into DuckDB
-
-st.subheader("Load into DuckDB")
-
-if st.session_state.cleaned_df is None:
-    st.info("Clean data first.")
-else:
-    col_tbl, col_load = st.columns([2, 1])
-    with col_tbl:
-        table_name_input = st.text_input(
-            "Table name", value="tickets",
-            help="Name used in SQL queries, e.g. SELECT * FROM tickets"
-        )
-    with col_load:
-        st.markdown("<br>", unsafe_allow_html=True)
-        load_btn = st.button("Load into DuckDB")
-
-    if load_btn:
-        bts: list = []
-        try:
-            db = DuckDBManager()
-            df_to_load = (
-                st.session_state.cleaned_df
-                if not isinstance(st.session_state.cleaned_df, dict)
-                else list(st.session_state.cleaned_df.values())[0]
-            )
-            register_cleaned_df(db.conn, df_to_load, table_name_input, bts)
-
-            llm         = get_llm("azure-openai", "charlie-gpt-4.1-mini")          
-            sql_gen     = LLMSQLGenerator(llm=llm)
-            orchestrator = QueryOrchestrator(
-                llm=llm,
-                conn=db.conn,
-                sql_generator=sql_gen,
-                default_table=table_name_input,
+            st.success(f"✅ Loaded {r['row_count']:,} rows into `{r['table_name']}`")
+            st.markdown(
+                _pills(
+                    rows=f"{r['row_count']:,}",
+                    cols=r["column_count"],
+                    tables=len(r["tables_created"]),
+                    bridges=len(r["bridge_tables"]),
+                ),
+                unsafe_allow_html=True,
             )
 
-            st.session_state.db           = db
-            st.session_state.orchestrator = orchestrator
-            st.session_state.table_name   = table_name_input
+            col_l, col_r = st.columns(2)
 
-            st.success(f"Table '{table_name_input}' loaded. Ready to query.")
-            _render_log(bts)
-        except Exception as e:
-            st.error(f"DuckDB load failed: {e}")
-            _render_log(bts)
+            with col_l:
+                with st.expander("🧹 Cleaning log", expanded=False):
+                    _render_log(r.get("cleaning_log", []))
+
+                with st.expander("📐 Normalization log", expanded=False):
+                    _render_log(r.get("norm_log", []))
+
+            with col_r:
+                with st.expander(f"📊 Column profile ({r['column_count']} columns)", expanded=False):
+                    profile_rows = []
+                    for col_name, stats in r.get("profile", {}).items():
+                        profile_rows.append({
+                            "column":     col_name,
+                            "dtype":      stats["dtype"],
+                            "nulls":      stats["num_nulls"],
+                            "% null":     f"{stats['pct_null']:.1f}",
+                            "unique":     stats["num_unique"],
+                            "multi?":     "⚠️" if stats.get("is_multi_valued") else "",
+                            "samples":    " | ".join(str(s) for s in stats["sample_values"][:2]),
+                        })
+                    st.dataframe(pd.DataFrame(profile_rows).set_index("column"), use_container_width=True)
+
+            # Bridge tables
+            if r["bridge_tables"]:
+                st.markdown("**Bridge tables created:**")
+                for bt in r["bridge_tables"]:
+                    st.markdown(
+                        f"<div class='bridge-card'>"
+                        f"<div class='name'>📎 {bt['name']}</div>"
+                        f"<div class='meta'>{bt['row_count']:,} rows · "
+                        f"columns: {', '.join(bt['columns'])} · "
+                        f"from: <code>{bt['source_col']}</code> (sep: <code>{bt['separator']}</code>)</div>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+            # Relationships
+            if r["relationships"]:
+                with st.expander("🔗 Inferred relationships", expanded=False):
+                    for rel in r["relationships"]:
+                        st.caption(
+                            f"`{rel['from_table']}.{rel['from_column']}` → "
+                            f"`{rel['to_table']}.{rel['to_column']}` ({rel.get('type','')})"
+                        )
 
 st.divider()
 
 
-# ── Natural language query ────────────────────────────────────────────────────
-st.subheader("Ask a question")
+# ── ③ Quick query (test without going to Chat page) ───────────────────────────
+st.markdown("<div class='step-header'>③ Quick test query</div>", unsafe_allow_html=True)
 
-if st.session_state.orchestrator is None:
-    st.info("Load data into DuckDB (step 3) to enable querying.")
+if st.session_state.ingest_result and st.session_state.ingest_result.get("success"):
+    q = st.text_input("Ask a quick question", placeholder="e.g. how many tickets are high priority?")
+    col_run, col_opts2 = st.columns([2, 2])
+    with col_opts2:
+        q_reasoning = st.checkbox("Reasoning mode")
+        q_debug     = st.checkbox("Debug mode", value=st.session_state.get("debug_mode", False))
+
+    if st.button("▶ Run query") and q:
+        with st.spinner("Querying…"):
+            try:
+                resp = requests.post(
+                    f"{API_BASE}/query/",
+                    json={
+                        "query":      q,
+                        "session_id": st.session_state.session_id,
+                        "reasoning":  q_reasoning,
+                        "debug_mode": q_debug,
+                    },
+                    timeout=60,
+                )
+                qr = resp.json()
+            except Exception as e:
+                st.error(f"Query failed: {e}")
+                qr = None
+
+        if qr:
+            if not qr["success"]:
+                st.error(qr.get("error", "Unknown error"))
+            else:
+                st.caption(f"Intent: `{qr['intent']}`")
+                if qr.get("rows"):
+                    st.dataframe(pd.DataFrame(qr["rows"]), use_container_width=True)
+                if qr.get("chart_json"):
+                    import plotly.io as pio
+                    fig = pio.from_json(qr["chart_json"])
+                    st.plotly_chart(fig, use_container_width=True, key="quick_chart")
+                if qr.get("llm_answer"):
+                    st.info(qr["llm_answer"])
+                if q_debug and qr.get("bts_log"):
+                    with st.expander("🪵 BTS log"):
+                        _render_log(qr["bts_log"])
+                if qr.get("sql") and q_debug:
+                    with st.expander("🗄️ SQL"):
+                        st.code(qr["sql"], language="sql")
 else:
-    col_q, col_opts = st.columns([4, 1])
-    with col_q:
-        user_query = st.text_input(
-            "Query",
-            placeholder="e.g.  Show tickets resolved in under 3 days  |  Plot ticket volume by priority",
-            label_visibility="collapsed",
-        )
-    with col_opts:
-        show_reasoning = st.checkbox("Reasoning", value=False)
-        force_path = st.selectbox("Path", ["sql", "python", "both"], index=0,
-            help="'both' runs SQL and Python in parallel — useful for testing")
-
-    run_query = st.button("Run", disabled=not bool(user_query))
-
-    if run_query and user_query:
-
-        if force_path == "both":
-            # Run both paths in parallel and show side by side
-            with st.spinner("Running both paths…"):
-                result_sql = st.session_state.orchestrator.run(
-                    user_query, reasoning=show_reasoning, force_intent="sql"
-                )
-                result_py = st.session_state.orchestrator.run(
-                    user_query, reasoning=show_reasoning, force_intent="python"
-                )
-
-            st.session_state.query_history.insert(0, result_sql)  # store SQL result as canonical
-
-            col_sql, col_py = st.columns(2)
-            with col_sql:
-                st.markdown("SQL path")
-                _render_query_result(result_sql)
-            with col_py:
-                st.markdown("Python path")
-                _render_query_result(result_py)
-
-        else:
-            with st.spinner("Running…"):
-                result = st.session_state.orchestrator.run(
-                    user_query,
-                    reasoning=show_reasoning,
-                    force_intent=None if force_path == "auto" else force_path,
-                )
-
-            st.session_state.query_history.insert(0, result)
-            _render_query_result(result)
-
-    # Query history
-    if len(st.session_state.query_history) > 1:
-        with st.expander(f"Query history ({len(st.session_state.query_history)} queries)", expanded=False):
-            for i, past in enumerate(st.session_state.query_history[1:], 1):
-                st.markdown(f"**{i}.** `{past.user_query}`")
-                _render_query_result(past)
+    st.info("Load data in step ② to enable test queries.")
 
 st.divider()
 
 
-# #  Download
-# st.subheader(" Download cleaned data")
+# ── ④ Download ────────────────────────────────────────────────────────────────
+st.markdown("<div class='step-header'>④ Download</div>", unsafe_allow_html=True)
 
-# if st.session_state.cleaned_df is None:
-#     st.info("No cleaned data yet.")
-# else:
-#     if isinstance(st.session_state.cleaned_df, dict):
-#         cols = st.columns(min(len(st.session_state.cleaned_df), 4))
-#         for col_w, (sheet, dfc) in zip(cols, st.session_state.cleaned_df.items()):
-#             with col_w:
-#                 st.download_button(
-#                     f"⬇ {sheet}.csv",
-#                     data=dfc.to_csv(index=False).encode(),
-#                     file_name=f"{sheet}_cleaned.csv",
-#                     mime="text/csv",
-#                     key=f"dl_{sheet}",
-#                 )
-#     else:
-#         st.download_button(
-#             "⬇ Download cleaned CSV",
-#             data=st.session_state.cleaned_df.to_csv(index=False).encode(),
-#             file_name="cleaned_data.csv",
-#             mime="text/csv",
-#         )
+if st.session_state.ingest_result and st.session_state.ingest_result.get("success"):
+    r = st.session_state.ingest_result
+    st.caption(f"Tables available: {', '.join(r['tables_created'])}")
+
+    col_dl = st.columns(min(len(r["tables_created"]), 4))
+    for i, tbl in enumerate(r["tables_created"]):
+        with col_dl[i % 4]:
+            try:
+                rows_resp = requests.post(
+                    f"{API_BASE}/query/",
+                    json={"query": f"SELECT * FROM {tbl}",
+                          "session_id": st.session_state.session_id,
+                          "force_intent": "sql"},
+                    timeout=30,
+                ).json()
+                if rows_resp.get("rows"):
+                    csv = pd.DataFrame(rows_resp["rows"]).to_csv(index=False).encode()
+                    st.download_button(f"⬇ {tbl}.csv", data=csv,
+                                       file_name=f"{tbl}_cleaned.csv",
+                                       mime="text/csv", key=f"dl_{tbl}")
+            except Exception:
+                st.caption(f"Could not prepare {tbl}")
+else:
+    st.info("No data loaded yet.")
