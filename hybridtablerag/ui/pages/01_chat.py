@@ -1,520 +1,369 @@
 """
 ui/pages/01_chat.py
 ====================
-Chat interface for Hybrid Table RAG.
-
-- Reads orchestrator + table from st.session_state set by streamlit_app.py
-- Displays conversation as chat bubbles
-- Each assistant message has a collapsible "How did I get this?" button
-  showing the SQL/Python code, reasoning chain, and BTS execution log
-- If DuckDB isn't loaded yet, shows a friendly redirect prompt
+Full context-aware chat interface.
+Debug-by-default (no toggles)
+Persistent history via API + session state
+Auto-chart rendering with unique keys
+Intent badges + inline result previews
+Error visibility at every step
 """
 
-import sys
+import io
 import os
+import sys
+import uuid
 from pathlib import Path
+from typing import Dict, List, Optional
 
 import pandas as pd
+import requests
 import streamlit as st
 
-# ── path ─────────────────────────────────────────────────────────────────────
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
-sys.path.insert(0, project_root)
+_root = str(Path(__file__).resolve().parent.parent.parent.parent)
+if _root not in sys.path:
+    sys.path.insert(0, _root)
 
-from hybridtablerag.reasoning.query_orchestrator import QueryResult
+API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Page config
-# ──────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Chat — Hybrid Table RAG", layout="wide", page_icon="")
+#  Page config 
+st.set_page_config(
+    page_title="Chat — HybridTableRAG",
+    layout="wide",
+    page_icon="",
+    initial_sidebar_state="expanded",
+)
 
+#  CSS: Chat bubbles, intent badges, debug panels 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+:root{--bg:#ffffff;--surface:#f7f8fa;--border:#e2e6ea;--accent:#2563eb;
+     --ok:#16a34a;--warn:#b45309;--err:#dc2626;--text:#0f172a;--muted:#64748b;
+     --bubble-user:#1e3a5f;--bubble-ai:#f0f4ff;}
+html,body,[data-testid="stAppViewContainer"]{background:var(--bg)!important;
+  color:var(--text)!important;font-family:'IBM Plex Sans',sans-serif;}
+[data-testid="stSidebar"]{background:var(--surface)!important;border-right:1px solid var(--border);}
 
-:root {
-  --bg: #ffffff;
-  --surface: #f7f7f8;
-  --surface2: #efefef;
-  --border: #e0e0e0;
-  --accent: #1a1a2e;
-  --accent-soft: #f0f0ff;
-  --ok: #16a34a;
-  --warn: #b45309;
-  --err: #dc2626;
-  --text: #111111;
-  --muted: #6b7280;
-  --bubble-user: #1a1a2e;
-  --bubble-user-text: #ffffff;
-  --bubble-ai: #f7f7f8;
-  --bubble-ai-text: #111111;
-}
+/* Chat bubbles */
+.bubble-wrap{display:flex;margin:1rem 0;align-items:flex-start;gap:.8rem;}
+.bubble-wrap.user{flex-direction:row-reverse;}
+.avatar{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;
+  justify-content:center;font-size:.7rem;font-weight:700;flex-shrink:0;
+  font-family:'IBM Plex Mono',monospace;}
+.avatar.user{background:var(--bubble-user);color:#fff;}
+.avatar.ai{background:#e2e8f0;color:var(--muted);border:1px solid var(--border);}
+.bubble{max-width:80%;padding:.7rem 1rem;border-radius:12px;font-size:.9rem;line-height:1.6;}
+.bubble.user{background:var(--bubble-user);color:#fff;border-bottom-right-radius:4px;}
+.bubble.ai{background:var(--bubble-ai);border:1px solid var(--border);border-bottom-left-radius:4px;}
 
-html, body, [data-testid="stAppViewContainer"] {
-  background: var(--bg) !important;
-  color: var(--text) !important;
-  font-family: 'IBM Plex Sans', sans-serif;
-}
+/* Intent badges */
+.intent-badge{display:inline-block;font-family:'IBM Plex Mono',monospace;font-size:.65rem;
+  font-weight:700;padding:.15rem .6rem;border-radius:5px;margin-bottom:.4rem;letter-spacing:.04em;}
+.intent-sql{background:#dbeafe;color:#1d4ed8;}
+.intent-python{background:#dcfce7;color:#15803d;}
+.intent-vector{background:#fef3c7;color:#92400e;}
+.intent-conv{background:#f3e8ff;color:#6b21a8;}
+.intent-err{background:#fee2e2;color:#991b1b;}
 
-[data-testid="stSidebar"] {
-  background: var(--surface) !important;
-}
+/* Debug panels */
+.log-panel{background:#f8f9fb;border:1px solid var(--border);border-left:3px solid var(--accent);
+  border-radius:0 6px 6px 0;padding:.7rem 1rem;max-height:240px;overflow-y:auto;
+  font-family:'IBM Plex Mono',monospace;font-size:.72rem;line-height:1.65;}
+.log-drop{color:var(--err);}.log-ok{color:var(--ok);}.log-warn{color:var(--warn);}.log-dim{color:var(--muted);}
+.context-pill{background:#fffbeb;border:1px solid #fde68a;border-radius:6px;
+  padding:.45rem .75rem;font-size:.75rem;color:#78350f;margin:.4rem 0;}
 
-/* ── page title ── */
-.chat-header {
-  padding: 1.5rem 0 0.5rem;
-  border-bottom: 2px solid var(--border);
-  margin-bottom: 1.5rem;
-}
-.chat-header h1 {
-  font-family: 'IBM Plex Mono', monospace;
-  font-size: 1.4rem;
-  font-weight: 700;
-  color: var(--accent);
-  margin: 0;
-  letter-spacing: -0.02em;
-}
-.chat-header p {
-  font-size: 0.82rem;
-  color: var(--muted);
-  margin: 0.3rem 0 0;
-}
-
-/* ── chat bubbles ── */
-.bubble-wrap {
-  display: flex;
-  margin-bottom: 1.2rem;
-  align-items: flex-start;
-  gap: 0.75rem;
-}
-.bubble-wrap.user  { flex-direction: row-reverse; }
-.bubble-wrap.ai    { flex-direction: row; }
-
-.avatar {
-  width: 32px; height: 32px;
-  border-radius: 50%;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 0.75rem; font-weight: 700;
-  flex-shrink: 0;
-  font-family: 'IBM Plex Mono', monospace;
-}
-.avatar.user { background: var(--accent); color: #fff; }
-.avatar.ai   { background: var(--surface2); color: var(--muted); border: 1px solid var(--border); }
-
-.bubble {
-  max-width: 72%;
-  padding: 0.75rem 1rem;
-  border-radius: 12px;
-  font-size: 0.88rem;
-  line-height: 1.6;
-}
-.bubble.user {
-  background: var(--bubble-user);
-  color: var(--bubble-user-text);
-  border-bottom-right-radius: 3px;
-}
-.bubble.ai {
-  background: var(--bubble-ai);
-  color: var(--bubble-ai-text);
-  border: 1px solid var(--border);
-  border-bottom-left-radius: 3px;
-}
-
-/* ── intent badge ── */
-.intent-badge {
-  display: inline-block;
-  font-family: 'IBM Plex Mono', monospace;
-  font-size: 0.68rem;
-  font-weight: 600;
-  padding: 0.15rem 0.5rem;
-  border-radius: 4px;
-  margin-bottom: 0.4rem;
-  letter-spacing: 0.04em;
-}
-.intent-sql    { background: #dbeafe; color: #1d4ed8; }
-.intent-python { background: #dcfce7; color: #15803d; }
-.intent-err    { background: #fee2e2; color: #b91c1c; }
-
-/* ── reasoning panel ── */
-.reasoning-panel {
-  background: #fafafa;
-  border: 1px solid var(--border);
-  border-left: 3px solid var(--accent);
-  border-radius: 0 8px 8px 0;
-  padding: 0.9rem 1rem;
-  font-size: 0.8rem;
-  color: var(--muted);
-  margin-top: 0.6rem;
-  line-height: 1.65;
-}
-.reasoning-panel strong { color: var(--text); }
-
-/* ── log block ── */
-.log-mini {
-  background: #f9f9f9;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 0.6rem 0.8rem;
-  font-family: 'IBM Plex Mono', monospace;
-  font-size: 0.72rem;
-  max-height: 220px;
-  overflow-y: auto;
-  line-height: 1.7;
-  margin-top: 0.5rem;
-}
-.ll-drop { color: var(--err); }
-.ll-ok   { color: var(--ok); }
-.ll-flat { color: #6366f1; }
-.ll-warn { color: var(--warn); }
-.ll-dim  { color: #9ca3af; }
-
-/* ── input bar ── */
-.input-bar-label {
-  font-family: 'IBM Plex Mono', monospace;
-  font-size: 0.78rem;
-  color: var(--muted);
-  margin-bottom: 0.3rem;
-}
-
-/* ── no-data state ── */
-.no-data-box {
-  background: var(--surface);
-  border: 1px dashed var(--border);
-  border-radius: 10px;
-  padding: 2.5rem 2rem;
-  text-align: center;
-  color: var(--muted);
-  font-size: 0.88rem;
-  margin-top: 2rem;
-}
-.no-data-box strong { color: var(--text); font-size: 1rem; display: block; margin-bottom: 0.5rem; }
-
-/* hide Streamlit chrome on chat page */
-[data-testid="stToolbar"] { display: none; }
+/* Buttons & inputs */
+.stButton>button{background:var(--accent);color:#fff;border:none;border-radius:6px;
+  font-family:'IBM Plex Mono',monospace;font-weight:600;padding:.45rem 1.2rem;}
+.stButton>button:hover{opacity:.88;}
+[data-testid="stDataFrame"]{border:1px solid var(--border)!important;border-radius:6px;}
+.debug-always{display:inline-block;background:#dbeafe;color:#1d4ed8;
+  font-family:'IBM Plex Mono',monospace;font-size:.65rem;font-weight:700;
+  padding:.1rem .45rem;border-radius:4px;margin-left:.4rem;}
 </style>
 """, unsafe_allow_html=True)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Session state for chat history
-# ──────────────────────────────────────────────────────────────────────────────
+#  Session state 
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())[:8]
 if "chat_messages" not in st.session_state:
-    st.session_state.chat_messages = []   # list of {"role": "user"|"ai", "result": QueryResult|str}
+    # Load from API on first visit
+    try:
+        hist = requests.get(f"{API_BASE}/history/{st.session_state.session_id}", timeout=2).json()
+        st.session_state.chat_messages = [
+            {"role": "user", "text": t["user_query"]}
+            if t.get("intent") != "conversational" or "answer" not in t.get("result_summary", "").lower()
+            else {"role": "ai", "result": {"success": True, "intent": "conversational", "llm_answer": t.get("result_summary", "")}}
+            for t in hist.get("turns", [])
+        ]
+    except:
+        st.session_state.chat_messages = []
 
+# DEBUG IS ALWAYS ON — no checkbox
+DEBUG_MODE = True
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
+#  Sidebar: Health + Settings 
+with st.sidebar:
+    st.markdown("### Chat Settings")
+    
+    # Always-visible debug badge
+    st.markdown("<span class='debug-always'>DEBUG MODE: ON</span>", unsafe_allow_html=True)
+    
+    reasoning_mode = st.checkbox("Reasoning mode", value=True,
+        help="Ask LLM to explain its query derivation step by step")
+    force_path = st.selectbox("Force intent", ["auto", "sql", "python", "vector", "conversational"])
+    top_k = st.slider("Vector top-K", 3, 20, 10)
+    
+    st.divider()
+    st.caption(f"Session: `{st.session_state.session_id}`")
+    
+    # Clear chat button
+    if st.button("🗑 Clear chat history"):
+        st.session_state.chat_messages = []
+        try:
+            requests.delete(f"{API_BASE}/history/{st.session_state.session_id}", timeout=5)
+        except:
+            pass
+        st.rerun()
+    
+    st.divider()
+    
+    # Live health check
+    try:
+        health = requests.get(f"{API_BASE}/health/", timeout=2).json()
+        non_sys = [t for t in health.get("tables", []) if t != "chat_history"]
+        if non_sys:
+            st.markdown("**Active tables:**")
+            for t in non_sys:
+                cnt = health.get("row_counts", {}).get(t, "?")
+                st.caption(f"`{t}` — {cnt:,} rows" if isinstance(cnt, int) else f"`{t}`")
+        else:
+            st.warning("No data loaded.\nGo to the **main page** to upload a file.")
+    except Exception as e:
+        st.caption(f"API status: unreachable ({e})")
 
+#  Helpers 
 def _log_class(line: str) -> str:
     l = line.lower()
-    if any(k in l for k in ("dropped", "error")):  return "ll-drop"
-    if any(k in l for k in ("normalised", "complete")): return "ll-ok"
-    if any(k in l for k in ("flattened", "intent", "routed")): return "ll-flat"
-    if any(k in l for k in ("numeric", "warn")):   return "ll-warn"
-    return "ll-dim"
+    if any(k in l for k in ("error", "failed", "exception")): return "log-drop"
+    if any(k in l for k in ("complete", "returned", "succeeded")): return "log-ok"
+    if any(k in l for k in ("warn", "retry", "0 rows")): return "log-warn"
+    return "log-dim"
 
+def _render_log(log: List[str]):
+    if not log:
+        st.caption("No execution log.")
+        return
+    html = "".join(f"<div class='{_log_class(l)}'>› {l}</div>" for l in log)
+    st.markdown(f"<div class='log-panel'>{html}</div>", unsafe_allow_html=True)
 
-def _render_log_mini(log: list[str]):
-    html = "".join(
-        f"<div class='{_log_class(l)}'>› {l}</div>" for l in log
-    )
-    st.markdown(f"<div class='log-mini'>{html}</div>", unsafe_allow_html=True)
+def _intent_badge(intent: str) -> str:
+    mapping = {
+        "sql": ('<span class="intent-badge intent-sql">SQL</span>'),
+        "python": ('<span class="intent-badge intent-python">PYTHON</span>'),
+        "vector": ('<span class="intent-badge intent-vector">VECTOR</span>'),
+        "conversational": ('<span class="intent-badge intent-conv">CHAT</span>'),
+    }
+    badge, icon = mapping.get(intent, ('<span class="intent-badge intent-err">?</span>'))
+    return badge, icon
 
-
-def _summary_text(result: QueryResult) -> str:
-    """One-line plain-text summary of the result for the bubble."""
-    if not result.success:
-        return f"Something went wrong: {result.error}"
-    if result.dataframe is not None:
-        r, c = result.dataframe.shape
-        noun = "row" if r == 1 else "rows"
-        return f"Done — {r} {noun}, {c} columns returned."
+def _result_summary(qr: Dict) -> str:
+    if not qr.get("success"):
+        return f"Error: {qr.get('error', 'Unknown')}"
+    if qr.get("llm_answer"):
+        words = qr["llm_answer"].split()
+        return " ".join(words[:30]) + ("…" if len(words) > 30 else "")
+    if qr.get("rows"):
+        return f"{qr.get('row_count', len(qr['rows'])):,} row(s) returned"
+    if qr.get("chart_json"):
+        return "Chart generated"
+    if qr.get("vector_results"):
+        return f"{len(qr['vector_results'])} similar result(s)"
     return "Done."
 
-
-def _render_reasoning_panel(result: QueryResult, uid: str = ''):
-    """The expandable 'How did I get this?' panel under each AI bubble."""
-    with st.expander("How did I get this?", expanded=False):
-        tab_labels = ["Result", "SQL / Code", "Reasoning", "Execution log"]
-        tabs = st.tabs(tab_labels)
-
-        # Tab 0 — full dataframe
+def _render_debug_panel(qr: Dict, msg_idx: int):
+    """5-tab debug panel — always expanded in debug mode."""
+    with st.expander("How did I get this? (Debug)", expanded=True):
+        tabs = st.tabs(["Result", "SQL / Code", "Reasoning", "Context", "Execution Log"])
+        
         with tabs[0]:
-            if result.chart is not None:
-                st.plotly_chart(result.chart, use_container_width=True, key=f'chart_panel_{uid}')
-            if result.dataframe is not None and not result.dataframe.empty:
-                st.dataframe(result.dataframe, use_container_width=True)
-            elif result.dataframe is not None:
-                st.info("Query returned no rows.")
-            elif not result.success:
-                st.error(result.error)
-
-        # Tab 1 — SQL or Python code
+            if qr.get("chart_json"):
+                import plotly.io as pio
+                fig = pio.from_json(qr["chart_json"])
+                # UNIQUE KEY to avoid Streamlit duplicate element error
+                st.plotly_chart(fig, use_container_width=True, key=f"chart_dbg_{msg_idx}_{uuid.uuid4().hex[:6]}")
+            if qr.get("rows"):
+                st.dataframe(pd.DataFrame(qr["rows"]), use_container_width=True)
+            elif qr.get("python_rows"):
+                st.dataframe(pd.DataFrame(qr["python_rows"]), use_container_width=True)
+            elif qr.get("vector_results"):
+                st.dataframe(pd.DataFrame(qr["vector_results"]), use_container_width=True)
+            elif qr.get("llm_answer"):
+                st.markdown(qr["llm_answer"])
+            elif not qr.get("success"):
+                st.error(qr.get("error", "Unknown error"))
+            else:
+                st.info("No result data returned.")
+        
         with tabs[1]:
-            if result.sql:
-                lang = "sql" if result.intent == "sql" else "python"
-                st.code(result.sql, language=lang)
+            if qr.get("sql") and qr.get("intent") == "sql":
+                st.markdown("**Generated SQL:**")
+                st.code(qr["sql"], language="sql")
+            elif qr.get("python_code"):
+                st.markdown("**Generated Python:**")
+                st.code(qr["python_code"], language="python")
             else:
-                st.info("No SQL or code was generated.")
-
-        # Tab 2 — LLM reasoning chain
+                st.caption("No SQL or code generated for this intent.")
+        
         with tabs[2]:
-            if result.reasoning:
-                st.markdown(
-                    f"<div class='reasoning-panel'>{result.reasoning}</div>",
-                    unsafe_allow_html=True,
-                )
+            if qr.get("reasoning"):
+                st.markdown(qr["reasoning"])
             else:
-                st.caption(
-                    "Reasoning not captured. Re-run the query with "
-                    "**Reasoning mode** enabled (toggle in the input bar)."
-                )
-
-        # Tab 3 — BTS execution log
+                st.caption("Enable **Reasoning mode** in sidebar to capture chain-of-thought.")
+        
         with tabs[3]:
-            if result.bts_log:
-                _render_log_mini(result.bts_log)
+            ctx = qr.get("context_used")
+            if ctx:
+                st.markdown(f"<div class='context-pill'>📌 Context injected:<br/>{ctx}</div>", unsafe_allow_html=True)
             else:
-                st.caption("No log available.")
+                st.caption("No prior context was injected for this turn.")
+        
+        with tabs[4]:
+            log = qr.get("bts_log", [])
+            if log:
+                _render_log(log)
+            else:
+                st.caption("No execution log captured.")
 
-
-def _render_message(msg: dict, idx: int):
-    """Render one chat turn — user, single AI, or dual SQL+Python AI."""
-    role = msg["role"]
-
-    if role == "user":
+def _render_message(msg: Dict, idx: int):
+    """Render one conversation turn with full debug visibility."""
+    if msg["role"] == "user":
         st.markdown(
             f"<div class='bubble-wrap user'>"
-            f"  <div class='avatar user'>YOU</div>"
-            f"  <div class='bubble user'>{msg['text']}</div>"
+            f"<div class='avatar user'>YOU</div>"
+            f"<div class='bubble user'>{msg['text']}</div>"
             f"</div>",
             unsafe_allow_html=True,
         )
+        return
+    
+    # AI message
+    qr = msg["result"]
+    badge_html, icon = _intent_badge(qr.get("intent", "sql"))
+    summary = _result_summary(qr)
+    
+    st.markdown(
+        f"<div class='bubble-wrap ai'>"
+        f"<div class='avatar ai'>AI</div>"
+        f"<div class='bubble ai'>{badge_html}<br/>{summary}</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    
+    # Inline result preview (main view)
+    if qr.get("chart_json") and qr.get("intent") == "python":
+        import plotly.io as pio
+        fig = pio.from_json(qr["chart_json"])
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_main_{idx}_{uuid.uuid4().hex[:6]}")
+    
+    if qr.get("rows") and qr.get("intent") == "sql":
+        st.dataframe(pd.DataFrame(qr["rows"]).head(20), use_container_width=True)
+    
+    if qr.get("vector_results") and qr.get("intent") == "vector":
+        st.dataframe(pd.DataFrame(qr["vector_results"]).head(10), use_container_width=True)
+    
+    if qr.get("llm_answer") and qr.get("intent") == "conversational":
+        st.markdown(qr["llm_answer"])
+    
+    if not qr.get("success"):
+        st.error(qr.get("error", "Unknown error"))
+    
+    # ALWAYS SHOW DEBUG PANEL (debug-by-default)
+    _render_debug_panel(qr, idx)
 
-    elif role == "ai_dual":
-        # ── Both SQL + Python results side by side ────────────────────────
-        result_sql: QueryResult = msg["result_sql"]
-        result_py:  QueryResult = msg["result_py"]
-
-        # Single AI bubble summarising both
-        sql_rows = len(result_sql.dataframe) if result_sql.dataframe is not None else 0
-        has_chart = result_py.chart is not None
-        summary = (
-            f"SQL returned {sql_rows} rows · "
-            f"Python {'generated a chart' if has_chart else 'computed analysis'}"
-        )
-        st.markdown(
-            f"<div class='bubble-wrap ai'>"
-            f"  <div class='avatar ai'>AI</div>"
-            f"  <div class='bubble ai'>"
-            f"    <span class='intent-badge intent-sql'>SQL</span>&nbsp;"
-            f"    <span class='intent-badge intent-python'>PYTHON</span><br>"
-            f"    {summary}"
-            f"  </div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-
-        # Side-by-side panels
-        col_sql, col_py = st.columns(2)
-
-        with col_sql:
-            st.markdown("##### SQL answer")
-            if not result_sql.success:
-                st.error(result_sql.error)
-            else:
-                if result_sql.dataframe is not None and not result_sql.dataframe.empty:
-                    st.dataframe(result_sql.dataframe, use_container_width=True)
-                else:
-                    st.info("No rows returned.")
-            with st.expander("SQL · How did I get this?", expanded=False):
-                tabs = st.tabs(["SQL", "Reasoning", "Log"])
-                with tabs[0]:
-                    if result_sql.sql:
-                        st.code(result_sql.sql, language="sql")
-                with tabs[1]:
-                    if result_sql.reasoning:
-                        st.markdown(result_sql.reasoning)
-                    else:
-                        st.caption("Enable Reasoning mode to see chain-of-thought.")
-                with tabs[2]:
-                    _render_log_mini(result_sql.bts_log)
-
-        with col_py:
-            st.markdown("##### Python analysis")
-            if not result_py.success:
-                st.error(result_py.error)
-            else:
-                if result_py.chart is not None:
-                    st.plotly_chart(result_py.chart, use_container_width=True, key=f'chart_dual_{idx}')
-                if result_py.dataframe is not None and not result_py.dataframe.empty:
-                    st.dataframe(result_py.dataframe, use_container_width=True)
-                elif result_py.chart is None:
-                    st.info("No output produced.")
-            with st.expander("Python · How did I get this?", expanded=False):
-                tabs = st.tabs(["Code", "Log"])
-                with tabs[0]:
-                    if result_py.sql:
-                        code_block = result_py.sql.replace("-- Python path (SQL pre-filter + pandas/plotly)\n", "")
-                        st.code(code_block, language="python")
-                with tabs[1]:
-                    _render_log_mini(result_py.bts_log)
-
-    else:  # single ai result
-        result: QueryResult = msg["result"]
-
-        if not result.success:
-            badge = "<span class='intent-badge intent-err'>ERROR</span>"
-        elif result.intent == "sql":
-            badge = "<span class='intent-badge intent-sql'>SQL</span>"
-        else:
-            badge = "<span class='intent-badge intent-python'>PYTHON</span>"
-
-        summary = _summary_text(result)
-
-        st.markdown(
-            f"<div class='bubble-wrap ai'>"
-            f"  <div class='avatar ai'>AI</div>"
-            f"  <div class='bubble ai'>"
-            f"    {badge}<br>{summary}"
-            f"  </div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-
-        # Reasoning panel lives outside the bubble (full-width)
-        _render_reasoning_panel(result, uid=str(idx))
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Page header
-# ──────────────────────────────────────────────────────────────────────────────
+# Header
 st.markdown(
-    "<div class='chat-header'>"
-    "<h1>Chat with your data</h1>"
-    "<p>Ask anything about your loaded table in plain English.</p>"
-    "</div>",
+    "<h2 style='margin:0;padding-top:1rem'>💬 Chat with your data</h2>"
+    "<p style='color:#64748b;font-size:.85rem;margin-top:.2rem'>"
+    "Ask anything — SQL, charts, semantic search, or follow-ups. Debug info always visible.</p>",
     unsafe_allow_html=True,
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Guard: require DuckDB to be loaded
-# ──────────────────────────────────────────────────────────────────────────────
-orchestrator = st.session_state.get("orchestrator")
-table_name   = st.session_state.get("table_name", "—")
+# Check data is loaded
+data_ready = False
+try:
+    h = requests.get(f"{API_BASE}/health/", timeout=2).json()
+    non_sys = [t for t in h.get("tables", []) if t != "chat_history"]
+    data_ready = bool(non_sys)
+except:
+    pass
 
-if orchestrator is None:
-    st.markdown(
-        "<div class='no-data-box'>"
-        "<strong>No data loaded yet</strong>"
-        "Go to the <b>main page</b>, upload a file, clean it, "
-        "and click <em>Load into DuckDB</em> before using the chat."
-        "</div>",
-        unsafe_allow_html=True,
-    )
+if not data_ready:
+    st.warning("No data loaded. Go to the **main page**, upload a file, and click **Run Pipeline**.")
     st.stop()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Active table indicator + clear button
-# ──────────────────────────────────────────────────────────────────────────────
-col_info, col_clear = st.columns([5, 1])
-with col_info:
-    cleaned = st.session_state.get("cleaned_df")
-    if cleaned is not None:
-        df_ref = cleaned if isinstance(cleaned, pd.DataFrame) else list(cleaned.values())[0]
-        r, c = df_ref.shape
-        st.caption(f"Active table: **{table_name}** — {r} rows × {c} columns")
-    else:
-        st.caption(f"Active table: **{table_name}**")
-
-with col_clear:
-    if st.button("Clear chat", use_container_width=True):
-        st.session_state.chat_messages = []
-        st.rerun()
-
 st.divider()
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Chat history
-# ──────────────────────────────────────────────────────────────────────────────
-chat_container = st.container()
-with chat_container:
-    if not st.session_state.chat_messages:
-        st.markdown(
-            "<p style='color:#9ca3af;font-size:.85rem;text-align:center;"
-            "padding:2rem 0'>No messages yet — ask something below ↓</p>",
-            unsafe_allow_html=True,
-        )
-    else:
-        for idx, msg in enumerate(st.session_state.chat_messages):
-            _render_message(msg, idx)
+if not st.session_state.chat_messages:
+    st.markdown(
+        "<p style='text-align:center;color:#94a3b8;padding:3rem 0'>No messages yet — ask something below ↓</p>",
+        unsafe_allow_html=True,
+    )
+else:
+    for i, msg in enumerate(st.session_state.chat_messages):
+        _render_message(msg, i)
 
 st.divider()
 
-# ──────────────────────────────────────────────────────────────────────────────
 # Input bar
-# ──────────────────────────────────────────────────────────────────────────────
-st.markdown("<div class='input-bar-label'>Ask a question about your data</div>", unsafe_allow_html=True)
-
-col_input, col_send = st.columns([5, 1])
-with col_input:
+col_q, col_send = st.columns([5, 1])
+with col_q:
     user_input = st.text_input(
-        "user_input",
-        placeholder='e.g. "What is the correlation between priority and resolution time?" or "Plot ticket trends"',
+        "Ask a question",
+        placeholder='e.g. "How many High priority tickets?" · "Plot volume by department" · "Find tickets about login" · "What did I ask earlier?"',
         label_visibility="collapsed",
         key="chat_input",
     )
 with col_send:
-    send = st.button("Send", use_container_width=True, type="primary")
+    send_btn = st.button("Send", type="primary", use_container_width=True)
 
-# Options row
-col_r, col_p, _ = st.columns([1, 1, 3])
-with col_r:
-    reasoning_mode = st.checkbox("Reasoning mode", value=False,
-        help="Ask the LLM to explain its SQL derivation step by step")
-with col_p:
-    force_path = st.selectbox(
-        "Path",
-        ["auto (sql + python)", "sql only", "python only"],
-        help=(
-            "auto — runs both SQL and Python, shows answers side by side\n"
-            "sql only — structured queries, counts, filters\n"
-            "python only — analytics, stats, numpy, charts"
-        ),
-    )
+# Suggested questions
+st.caption("Try: "
+    "`How many tickets per priority?` | "
+    "`Plot ticket volume over time` | "
+    "`Find tickets about system failures` | "
+    "`What did I ask earlier?`")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Handle submission
-# ──────────────────────────────────────────────────────────────────────────────
-if send and user_input.strip():
+# ── Handle submission ─────────────────────────────────────────────────────────
+if send_btn and user_input.strip():
     query = user_input.strip()
-
+    
+    # Add user message
     st.session_state.chat_messages.append({"role": "user", "text": query})
-
-    auto_mode = force_path.startswith("auto")
-
-    if auto_mode:
-        # Run both paths — show SQL and Python side by side
-        with st.spinner("Running SQL + Python analysis…"):
-            result_sql = orchestrator.run(
-                query, reasoning=reasoning_mode, force_intent="sql"
+    
+    with st.spinner("Thinking…"):
+        try:
+            resp = requests.post(
+                f"{API_BASE}/query/",
+                json={
+                    "query": query,
+                    "session_id": st.session_state.session_id,
+                    "reasoning": reasoning_mode,
+                    "debug_mode": DEBUG_MODE,  # always True
+                    "force_intent": None if force_path == "auto" else force_path,
+                    "top_k_vector": top_k,
+                },
+                timeout=90,
             )
-            result_py = orchestrator.run(
-                query, reasoning=reasoning_mode, force_intent="python"
-            )
-        st.session_state.chat_messages.append({
-            "role":       "ai_dual",
-            "result_sql": result_sql,
-            "result_py":  result_py,
-        })
-
-    else:
-        intent = "sql" if force_path.startswith("sql") else "python"
-        with st.spinner(f"Running {intent} path…"):
-            result = orchestrator.run(
-                query, reasoning=reasoning_mode, force_intent=intent
-            )
-        st.session_state.chat_messages.append({"role": "ai", "result": result})
-
+            qr = resp.json()
+        except Exception as e:
+            qr = {"success": False, "intent": "error", "error": f"API error: {e}", "bts_log": [f"Request failed: {e}"]}
+    
+    # Add AI response
+    st.session_state.chat_messages.append({"role": "ai", "result": qr})
+    
+    # Auto-scroll to bottom via rerun
     st.rerun()
