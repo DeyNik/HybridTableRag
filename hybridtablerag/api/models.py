@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
-# ── Ingest ────────────────────────────────────────────────────────────────────
+# Ingest 
 
 class IngestOptions(BaseModel):
     """Options sent alongside the file upload."""
@@ -52,7 +52,7 @@ class IngestResponse(BaseModel):
     error:            Optional[str] = None
 
 
-# ── Query ─────────────────────────────────────────────────────────────────────
+# Query
 
 class QueryRequest(BaseModel):
     query:         str
@@ -96,7 +96,7 @@ class QueryResponse(BaseModel):
     python_error:     Optional[str]         = None
 
 
-# ── Session / History ─────────────────────────────────────────────────────────
+# Session / History
 
 class SessionTurn(BaseModel):
     session_id:     str
@@ -120,7 +120,7 @@ class ClearHistoryResponse(BaseModel):
     turns_deleted: int
 
 
-# ── Health ────────────────────────────────────────────────────────────────────
+# Health
 
 class HealthResponse(BaseModel):
     status:        str             # "ok" | "degraded" | "not_ready"

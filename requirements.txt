@@ -22,7 +22,7 @@ python-multipart
 tqdm
 
 dotenv
-# optional but likely in your stack
+
 #langchain
 openai
 #faiss-cpu

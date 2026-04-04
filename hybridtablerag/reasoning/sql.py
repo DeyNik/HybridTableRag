@@ -1,12 +1,6 @@
 """
 reasoning/sql.py
-===========================
-
-Improved version:
-- Fixes regex bug in date arithmetic
-- Adds multi-table JOIN awareness
-- Keeps backward compatibility with single-table schema
-- Cleaner validation + safer LLM output handling
+================
 """
 
 import json
@@ -16,53 +10,73 @@ from typing import Any, Dict, List
 from hybridtablerag.llm.base import BaseLLM
 
 
-# ──────────────────────────────────────────────────────────────
 # Safety allow-list
-# ──────────────────────────────────────────────────────────────
 
 FORBIDDEN_KEYWORDS = [
     "DROP", "DELETE", "UPDATE", "INSERT",
-    "ALTER", "TRUNCATE", "CREATE",
+    "ALTER", "TRUNCATE", "CREATE", "REPLACE",
 ]
 
 
 class SQLValidator:
     @staticmethod
     def validate(sql: str) -> None:
-        sql_upper = sql.upper()
-        if not sql_upper.strip().startswith("SELECT"):
-            raise ValueError("Only SELECT statements are allowed.")
+        """
+        Validate SQL is read-only SELECT (with optional CTEs).
+        """
+        # Remove string literals to avoid matching keywords inside values
+        # e.g., WHERE status = 'DELETE' should not trigger forbidden check
+        sql_no_strings = re.sub(r"'[^']*'", "''", sql)
+        sql_no_strings = re.sub(r'"[^"]*"', '""', sql_no_strings)  # Handle double-quoted strings
+        sql_upper = sql_no_strings.upper()
+
+        # Allow WITH ... SELECT patterns (CTEs)
+        stripped = sql_upper.strip()
+        if not (stripped.startswith("SELECT") or stripped.startswith("WITH")):
+            raise ValueError("Only SELECT statements (with optional CTEs) are allowed.")
+
+        # Check forbidden keywords only in non-string context
         for keyword in FORBIDDEN_KEYWORDS:
+            # Use word boundary + check it's not inside a string/comment
             if re.search(rf"\b{keyword}\b", sql_upper):
-                raise ValueError(f"Forbidden SQL keyword detected: {keyword}")
+                # Double-check: is this keyword inside a string literal in the original?
+                # Simple heuristic: count quotes before the match
+                match = re.search(rf"\b{keyword}\b", sql_upper)
+                if match:
+                    pos = match.start()
+                    # Count single quotes before this position in original sql
+                    before = sql[:pos]
+                    single_quotes = before.count("'") - before.count("\\'")
+                    # If odd number of quotes, we're inside a string — allow it
+                    if single_quotes % 2 == 0:
+                        raise ValueError(f"Forbidden SQL keyword detected: {keyword}")
 
 
-# ──────────────────────────────────────────────────────────────
 # SQL cleanup
-# ──────────────────────────────────────────────────────────────
 
 def clean_sql(raw: str) -> str:
     sql = raw.strip()
+    # Remove markdown code fences
     sql = re.sub(r"^```(?:sql)?\s*\n?", "", sql, flags=re.IGNORECASE)
     sql = re.sub(r"\n?```\s*$", "", sql).strip()
+    # Remove leading "sql" keyword if present
     if sql.lower().startswith("sql"):
         sql = sql[3:].strip()
     return sql
 
 
-# ──────────────────────────────────────────────────────────────
 # DuckDB fixes
-# ──────────────────────────────────────────────────────────────
 
 def _fix_duckdb_date_arithmetic(sql: str) -> tuple[str, list[str]]:
     fixes: list[str] = []
 
+    # Pattern: col1 - col2 <op> INTERVAL 'N unit'
     interval_cmp = re.compile(
         r'(CAST\s*\([^)]+\)|\b\w+(?:\.\w+)?)\s*'
         r'-\s*'
         r'(CAST\s*\([^)]+\)|\b\w+(?:\.\w+)?)\s*'
         r'([<>=!]+)\s*'
-        r"INTERVAL\s*['\"](\d+)\s*(\w+)['\"]",   # ✅ FIXED (removed space before \d+)
+        r"INTERVAL\s*['\"](\d+)\s*(\w+)['\"]",
         re.IGNORECASE,
     )
 
@@ -83,9 +97,7 @@ def _fix_duckdb_date_arithmetic(sql: str) -> tuple[str, list[str]]:
     return interval_cmp.sub(_rewrite, sql), fixes
 
 
-# ──────────────────────────────────────────────────────────────
 # Schema formatter (supports multi-table)
-# ──────────────────────────────────────────────────────────────
 
 def _format_schema_for_prompt(schema_metadata: list) -> str:
     lines = []
@@ -115,15 +127,12 @@ def _format_schema_for_prompt(schema_metadata: list) -> str:
                 lines.append(f"    range: {r['min']} → {r['max']}")
 
             elif col.get("sample_values"):
-                lines.append(f"    samples: {', '.join(col['sample_values'])}")
+                lines.append(f"    samples: {', '.join(str(v) for v in col['sample_values'])}")
 
     return "\n".join(lines)
 
 
-# ──────────────────────────────────────────────────────────────
 # LLM SQL Generator
-# ──────────────────────────────────────────────────────────────
-
 class LLMSQLGenerator:
 
     def __init__(self, llm: BaseLLM):
@@ -137,7 +146,6 @@ class LLMSQLGenerator:
         relationships,
         reasoning: bool = False,
     ) -> str:
-
         if reasoning:
             output_instruction = """
 Return valid JSON:
@@ -188,12 +196,14 @@ Schema:
         sql: str,
         schema_metadata: List[Dict[str, Any]],
     ) -> bool:
-
+        """
+        Basic validation: ensure SQL references known tables.
+        """
         known_tables = {
             t["table_name"] for t in schema_metadata if "table_name" in t
         }
 
-        sql_norm = re.sub(r"[`\"]", "", sql.lower())
+        sql_norm = re.sub(r'[`"\']', "", sql.lower())
 
         if not any(t.lower() in sql_norm for t in known_tables):
             raise ValueError(
@@ -210,7 +220,9 @@ Schema:
         relationships,
         reasoning: bool = False,
     ):
-
+        """
+        Generate SQL from LLM with robust parsing.
+        """
         prompt = self._build_prompt(
             user_query,
             schema_metadata,
@@ -225,14 +237,31 @@ Schema:
             raw = raw[4:].strip()
 
         if reasoning:
-            parsed = json.loads(raw)
-            sql = clean_sql(parsed["sql_query"])
-            sql, _ = _fix_duckdb_date_arithmetic(sql)
-            self._basic_sql_validation(sql, schema_metadata)
-            return {"sql_query": sql, "reasoning": parsed["reasoning"]}
+            try:
+                parsed = json.loads(raw)
+                sql = clean_sql(parsed["sql_query"])
+                reasoning_text = parsed.get("reasoning", "")
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                # Fallback: extract SQL with regex if JSON fails
+                sql_match = re.search(r'"sql_query"\s*:\s*"([^"]+)"', raw)
+                if sql_match:
+                    sql = clean_sql(sql_match.group(1))
+                    reasoning_text = ""
+                else:
+                    # Last resort: treat entire response as SQL
+                    sql = clean_sql(raw)
+                    reasoning_text = ""
+                # Log the parse failure for debugging (could add to bts_log if passed in)
+        else:
+            sql = clean_sql(raw)
 
-        sql = clean_sql(raw)
+        # Apply DuckDB-specific fixes
         sql, _ = _fix_duckdb_date_arithmetic(sql)
+        
+        # Validate
         self._basic_sql_validation(sql, schema_metadata)
+        SQLValidator.validate(sql)
 
+        if reasoning:
+            return {"sql_query": sql, "reasoning": reasoning_text}
         return sql

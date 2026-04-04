@@ -6,7 +6,7 @@ Builds enriched schema context for LLM prompts.
 
 from typing import Any, Dict, List
 import pandas as pd
-
+from hybridtablerag.storage.utils import _escape_identifier
 
 CATEGORICAL_THRESHOLD = 25
 
@@ -38,43 +38,46 @@ def build_schema_context(conn, table_name: str, bts_log: List[str]) -> Dict[str,
     """
     Build schema context for ONE table.
     """
+    table_escaped = _escape_identifier(table_name)
 
     # --- row count ---
     row_count = conn.execute(
-        f"SELECT COUNT(*) FROM {table_name}"
+        f"SELECT COUNT(*) FROM {table_escaped}"
     ).fetchone()[0]
 
     # --- schema ---
     schema_rows = conn.execute(
-        f"DESCRIBE {table_name}"
+        f"DESCRIBE {table_escaped}"
     ).fetchall()
 
     columns = [row[0] for row in schema_rows]
+    columns_escaped = [_escape_identifier(col) for col in columns]
 
     # --- null counts (batched) ---
     null_exprs = [
-        f"SUM(CASE WHEN {col} IS NULL THEN 1 ELSE 0 END) AS {col}_nulls"
-        for col in columns
+        f"SUM(CASE WHEN {col_esc} IS NULL THEN 1 ELSE 0 END) AS {col}_nulls"
+        for col, col_esc in zip(columns, columns_escaped)
     ]
-    null_query = f"SELECT {', '.join(null_exprs)} FROM {table_name}"
+    null_query = f"SELECT {', '.join(null_exprs)} FROM {table_escaped}"
     null_counts = conn.execute(null_query).fetchone()
 
     # --- distinct counts (batched) ---
     distinct_exprs = [
-        f"COUNT(DISTINCT {col}) AS {col}_distinct"
-        for col in columns
+        f"COUNT(DISTINCT {col_esc}) AS {col}_distinct"
+        for col, col_esc in zip(columns, columns_escaped)
     ]
-    distinct_query = f"SELECT {', '.join(distinct_exprs)} FROM {table_name}"
+    distinct_query = f"SELECT {', '.join(distinct_exprs)} FROM {table_escaped}"
     distinct_counts = conn.execute(distinct_query).fetchone()
 
     # --- sample ---
     sample_df = conn.execute(
-        f"SELECT * FROM {table_name} LIMIT 3"
+        f"SELECT * FROM {table_escaped} LIMIT 3"
     ).fetchdf()
 
     col_contexts = []
 
     for i, col in enumerate(columns):
+        col_esc = columns_escaped[i]
         col_type = schema_rows[i][1]
         null_count = null_counts[i]
         distinct_count = distinct_counts[i]
@@ -92,9 +95,9 @@ def build_schema_context(conn, table_name: str, bts_log: List[str]) -> Dict[str,
         if distinct_count <= CATEGORICAL_THRESHOLD:
             try:
                 dist_df = conn.execute(f"""
-                    SELECT {col}, COUNT(*) as cnt
-                    FROM {table_name}
-                    GROUP BY {col}
+                    SELECT {col_esc}, COUNT(*) as cnt
+                    FROM {table_escaped}
+                    GROUP BY {col_esc}
                     ORDER BY cnt DESC
                 """).fetchdf()
 
@@ -103,15 +106,15 @@ def build_schema_context(conn, table_name: str, bts_log: List[str]) -> Dict[str,
                     for _, row in dist_df.iterrows()
                 ]
 
-            except Exception:
-                pass
+            except Exception as e:
+                bts_log.append(f"Failed to fetch distribution for {col}: {type(e).__name__}")
 
         # --- numeric ---
         elif any(t in col_upper for t in ["INT", "DOUBLE", "FLOAT", "DECIMAL", "BIGINT"]):
             try:
                 stats = conn.execute(f"""
-                    SELECT MIN({col}), MAX({col}), AVG({col})
-                    FROM {table_name}
+                    SELECT MIN({col_esc}), MAX({col_esc}), AVG({col_esc})
+                    FROM {table_escaped}
                 """).fetchone()
 
                 col_ctx["range"] = {
@@ -119,23 +122,23 @@ def build_schema_context(conn, table_name: str, bts_log: List[str]) -> Dict[str,
                     "max": _safe_val(stats[1]),
                     "avg": _safe_val(stats[2]),
                 }
-            except Exception:
-                pass
+            except Exception as e:
+                bts_log.append(f"Failed to fetch stats for {col}: {type(e).__name__}")
 
         # --- date ---
         elif any(t in col_upper for t in ["DATE", "TIMESTAMP"]):
             try:
                 stats = conn.execute(f"""
-                    SELECT MIN({col}), MAX({col})
-                    FROM {table_name}
+                    SELECT MIN({col_esc}), MAX({col_esc})
+                    FROM {table_escaped}
                 """).fetchone()
 
                 col_ctx["range"] = {
                     "min": _safe_val(stats[0]),
                     "max": _safe_val(stats[1]),
                 }
-            except Exception:
-                pass
+            except Exception as e:
+                bts_log.append(f"Failed to fetch date range for {col}: {type(e).__name__}")
 
         # --- fallback sample ---
         else:
@@ -164,7 +167,6 @@ def build_multi_table_schema_context(
     """
     Multi-table schema context.
     """
-
     tables_ctx = []
 
     for t in table_names:
@@ -181,7 +183,6 @@ def format_schema_for_prompt(schema_context: Dict[str, Any]) -> str:
     """
     Convert schema context to LLM-friendly text.
     """
-
     lines = []
 
     # --- MULTI TABLE ---
