@@ -53,7 +53,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -441,16 +441,10 @@ class Normalizer:
         df: pd.DataFrame,
         table_hint: str = 'table',
         log: Optional[List[str]] = None,
+        profile_hints: Optional[Dict[str, Dict]] = None,  # ← NEW: from profiler
     ) -> NormalizationPlan:
-        """
-        Analyse df and produce a NormalizationPlan.
+        
 
-        table_hint: base name for the main table (e.g. "tickets")
-                    used as prefix for bridge table names.
-
-        Returns NormalizationPlan — call .all_tables to get all DataFrames
-        for DuckDB registration.
-        """
         log = log or []
         main_table_name = re.sub(r'[^a-z0-9_]', '_', table_hint.lower()).strip('_')
 
@@ -463,12 +457,9 @@ class Normalizer:
         # Detect primary key
         pk_col = _detect_primary_key(df)
         if pk_col is None:
-            # Synthesise a PK from the row index
             pk_col = f"{main_table_name}_row_id"
             plan.main_df.insert(0, pk_col, range(len(df)))
-            log.append(
-                f"No natural PK found — synthesised '{pk_col}' from row index"
-            )
+            log.append(f"No natural PK found — synthesised '{pk_col}' from row index")
         else:
             log.append(f"Primary key: '{pk_col}'")
 
@@ -480,9 +471,25 @@ class Normalizer:
                 continue
 
             series = df[col]
+            
+            # ── Get profiler hint for this column ───────────────────
+            hint = None
+            if profile_hints and col in profile_hints:
+                stats = profile_hints[col]
+                if stats.get('is_multi_valued'):
+                    hint = {
+                        'type': stats.get('multi_val_type'),  # 'semicolon', 'json_list', etc.
+                    }
 
-            # ── JSON list-of-dicts ─────────────────────────────────────────
-            if _is_json_list_of_dicts(series):
+            # ── 1. JSON list-of-dicts ────────────────────────────────────
+            # Use hint if available, otherwise detect
+            is_json = False
+            if hint and hint['type'] == 'json_list':
+                is_json = True  # Trust profiler
+            else:
+                is_json = _is_json_list_of_dicts(series)  # Fallback detection
+
+            if is_json:
                 bridge_name, _ = _llm_name_bridge_table(
                     llm=self.llm,
                     main_table=main_table_name,
@@ -509,15 +516,22 @@ class Normalizer:
                     })
                 continue
 
-            # ── Semicolon / pipe separated ────────────────────────────────
-            sep = _detect_separator(series)
-
-            if sep is None:
-                # Check comma as a special case (ambiguous)
-                non_null = series.dropna().astype(str)
-                if not non_null.empty and ',' in non_null.iloc[0]:
-                    if _resolve_comma_ambiguity(self.llm, col, series):
-                        sep = ','
+            # ── 2. Separator-based (semicolon/pipe/comma) ───────────────
+            sep = None
+            
+            # Use hint if available
+            if hint and hint['type'] in ('semicolon', 'pipe', 'comma', 'slash'):
+                sep_map = {'semicolon': ';', 'pipe': '|', 'comma': ',', 'slash': '/'}
+                sep = sep_map[hint['type']]
+            else:
+                # Fallback to original detection logic
+                sep = _detect_separator(series)
+                if sep is None:
+                    # Check comma as special ambiguous case
+                    non_null = series.dropna().astype(str)
+                    if not non_null.empty and ',' in non_null.iloc[0]:
+                        if _resolve_comma_ambiguity(self.llm, col, series):
+                            sep = ','
 
             if sep is not None:
                 # Get LLM-assisted names

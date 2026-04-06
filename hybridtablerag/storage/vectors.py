@@ -11,10 +11,7 @@ import pandas as pd
 from hybridtablerag.storage.utils import _escape_identifier
 
 
-# ─────────────────────────────────────────────────────────────
 # Embedding interface
-# ─────────────────────────────────────────────────────────────
-
 class EmbeddingProvider(ABC):
     @abstractmethod
     def embed(self, texts: List[str]) -> List[List[float]]: pass
@@ -24,10 +21,8 @@ class EmbeddingProvider(ABC):
     def dimension(self) -> int: pass
 
 
-# ─────────────────────────────────────────────────────────────
-# Providers
-# ─────────────────────────────────────────────────────────────
 
+# Providers
 class SentenceTransformerProvider(EmbeddingProvider):
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
         from sentence_transformers import SentenceTransformer
@@ -74,10 +69,7 @@ def get_embedding_provider() -> EmbeddingProvider:
     return SentenceTransformerProvider(os.getenv("SENTENCE_TRANSFORMER_MODEL", "all-MiniLM-L6-v2"))
 
 
-# ─────────────────────────────────────────────────────────────
 # VectorStore
-# ─────────────────────────────────────────────────────────────
-
 class VectorStore:
     EMBEDDING_COL = "_embedding"
 
@@ -85,53 +77,94 @@ class VectorStore:
         self.conn = conn
         self.provider = provider
 
+    # Setup vector store
     def setup(self):
         try:
             self.conn.execute("INSTALL vss")
             self.conn.execute("LOAD vss")
+            self.conn.execute("SET hnsw_enable_experimental_persistence=true")
         except Exception as e:
             print(f"[VectorStore] Failed to load vss: {e}")
 
     def embed_table(self, table_name: str, text_columns: List[str], pk_column: str, bts_log: list):
         if not text_columns or not pk_column:
-            bts_log.append("Missing pk_column or text_columns for embedding")
+            bts_log.append(f"{table_name}: Missing pk_column or text_columns")
             return
 
         table_esc = _escape_identifier(table_name)
         pk_esc = _escape_identifier(pk_column)
         cols_esc = ", ".join(_escape_identifier(c) for c in text_columns)
 
-        df = self.conn.execute(f"SELECT {pk_esc}, {cols_esc} FROM {table_esc}").fetchdf()
+        # Skip if already embedded 
+        try:
+            existing = self.conn.execute(f"""
+                SELECT COUNT(*) FROM {table_esc}
+                WHERE {self.EMBEDDING_COL} IS NOT NULL
+            """).fetchone()[0]
+
+            if existing > 0:
+                bts_log.append(f"{table_name}: Already embedded, skipping")
+                return
+        except:
+            pass  # column might not exist yet
+
+        # Fetch data
+        df = self.conn.execute(
+            f"SELECT {pk_esc}, {cols_esc} FROM {table_esc}"
+        ).fetchdf()
+
         if df.empty:
-            bts_log.append(f"No rows to embed in {table_name}")
+            bts_log.append(f"{table_name}: No rows to embed")
             return
 
         texts, pks = [], []
+
         for _, row in df.iterrows():
-            parts = [f"{col}: {row[col]}" for col in text_columns if pd.notna(row[col])]
+            parts = []
+            for col in text_columns:
+                val = row[col]
+                if pd.notna(val):
+                    parts.append(f"{col}: {val}")
+
             if parts:
                 texts.append(" | ".join(parts))
                 pks.append(row[pk_column])
 
         if not texts:
-            bts_log.append("No valid text rows for embedding")
+            bts_log.append(f"{table_name}: No valid text rows")
             return
 
+        # Generate embeddings 
         vectors = self.provider.embed(texts)
         dim = self.provider.dimension
 
-        self.conn.execute(f"ALTER TABLE {table_esc} ADD COLUMN IF NOT EXISTS {self.EMBEDDING_COL} FLOAT[{dim}]")
+        #  Add column if needed 
+        self.conn.execute(
+            f"ALTER TABLE {table_esc} ADD COLUMN IF NOT EXISTS {self.EMBEDDING_COL} FLOAT[{dim}]"
+        )
+
+        #  Update embeddings 
         self.conn.executemany(
-            f"UPDATE {table_esc} SET {self.EMBEDDING_COL} = ? WHERE {pk_esc} = ?",
+            f"""
+            UPDATE {table_esc}
+            SET {self.EMBEDDING_COL} = ?
+            WHERE {pk_esc} = ?
+            """,
             list(zip(vectors, pks))
         )
 
+        # Create index 
         try:
-            self.conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_vss ON {table_esc} USING HNSW ({self.EMBEDDING_COL}) WITH (metric='cosine')")
+            self.conn.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_{table_name}_vss
+                ON {table_esc}
+                USING HNSW ({self.EMBEDDING_COL})
+                WITH (metric='cosine')
+            """)
         except Exception as e:
-            bts_log.append(f"HNSW index creation failed (non-critical): {e}")
+            bts_log.append(f"{table_name}: Index creation failed ({e})")
 
-        bts_log.append(f"Embedded {len(vectors)} rows from {table_name}")
+        bts_log.append(f"{table_name}: Embedded {len(vectors)} rows")
 
     def search(self, query: str, table_name: str, top_k: int = 10, sql_filter: Optional[str] = None) -> pd.DataFrame:
         query_vec = self.provider.embed([query])[0]

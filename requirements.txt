@@ -23,6 +23,7 @@ tqdm
 
 dotenv
 
+sentence-transformer
 #langchain
 openai
 #faiss-cpu

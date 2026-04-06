@@ -1,11 +1,7 @@
 """
-api/routes/history.py
-=====================
-GET  /history/{session_id}          — get conversation turns
-DELETE /history/{session_id}        — clear session history
-GET  /history/sessions/all          — list all sessions (admin/debug)
+api/routes/history.py  — fixed
+Bug fixed: /sessions/all moved to /admin/sessions to avoid conflict with /{session_id}
 """
-
 from fastapi import APIRouter, HTTPException
 from hybridtablerag.api.main import app_state
 from hybridtablerag.api.models import HistoryResponse, ClearHistoryResponse, SessionTurn
@@ -13,9 +9,19 @@ from hybridtablerag.api.models import HistoryResponse, ClearHistoryResponse, Ses
 router = APIRouter()
 
 
+@router.get("/admin/sessions")               # FIXED: was /sessions/all — conflicted with /{session_id}
+async def all_sessions():
+    if app_state.context_store is None:
+        raise HTTPException(503, "Context store not ready")
+    try:
+        df = app_state.context_store.get_all_sessions()
+        return df.to_dict("records")
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @router.get("/{session_id}", response_model=HistoryResponse)
 async def get_history(session_id: str, last_n: int = 20):
-    """Return the last N conversation turns for a session."""
     if app_state.context_store is None:
         raise HTTPException(503, "Context store not ready")
     try:
@@ -40,28 +46,11 @@ async def get_history(session_id: str, last_n: int = 20):
 
 @router.delete("/{session_id}", response_model=ClearHistoryResponse)
 async def clear_history(session_id: str):
-    """Clear all conversation turns for a session."""
     if app_state.context_store is None:
         raise HTTPException(503, "Context store not ready")
     try:
         before = len(app_state.context_store.get_history(session_id, last_n=9999))
         app_state.context_store.clear_session(session_id)
-        return ClearHistoryResponse(
-            success=True,
-            session_id=session_id,
-            turns_deleted=before,
-        )
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-@router.get("/sessions/all")
-async def all_sessions():
-    """Return a summary of all sessions (for admin/debug)."""
-    if app_state.context_store is None:
-        raise HTTPException(503, "Context store not ready")
-    try:
-        df = app_state.context_store.get_all_sessions()
-        return df.to_dict("records")
+        return ClearHistoryResponse(success=True, session_id=session_id, turns_deleted=before)
     except Exception as e:
         raise HTTPException(500, str(e))

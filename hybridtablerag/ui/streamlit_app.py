@@ -1,320 +1,243 @@
-"""
-ui/streamlit_app.py — API-INTEGRATED VERSION
-✅ Calls real /ingest endpoint
-✅ Shows real API responses
-✅ Debug-by-default, multi-file, multi-sheet
-"""
-
-import io
-import os
-import sys
-import uuid
-import time
-from pathlib import Path
-from typing import Dict, List, Optional
-
-import pandas as pd
-import requests
 import streamlit as st
+import sys, os
+from pathlib import Path
+import pandas as pd
 
-_root = str(Path(__file__).resolve().parent.parent.parent)
-if _root not in sys.path:
-    sys.path.insert(0, _root)
+# ── Project setup
+current_dir = Path(__file__).resolve().parent
+project_root = current_dir.parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
-API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
+from hybridtablerag.core.cleaner import read_file, clean_dataframe
+from hybridtablerag.core.normalizer import Normalizer
+from hybridtablerag.llm.factory import get_llm
+from hybridtablerag.storage.store import DuckDBStore
+from hybridtablerag.storage.vectors import VectorStore, get_embedding_provider
+from hybridtablerag.reasoning.intent import IntentClassifier
+from hybridtablerag.reasoning.sql import LLMSQLGenerator
+from hybridtablerag.reasoning.orchestrator import QueryOrchestrator
+from hybridtablerag.storage.schema import build_multi_table_schema_context, format_schema_for_prompt
 
-# ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="HybridTableRAG — Pipeline", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="HybridTableRAG Stepwise Interface", layout="wide")
+st.title("HybridTableRAG Stepwise Full-Detail Interface")
 
-# ── CSS (same as before, omitted for brevity) ─────────────────────────────────
-st.markdown("""
-<style>
-/* ... same CSS as previous version ... */
-</style>
-""", unsafe_allow_html=True)
-
-# ── Session state ─────────────────────────────────────────────────────────────
-_DEFAULTS = {
-    "session_id": None,
-    "upload_queue": [],
-    "api_ingest_result": None,
-    "loaded_tables": [],
-}
-for k, v in _DEFAULTS.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
-
-if not st.session_state.session_id:
-    st.session_state.session_id = str(uuid.uuid4())[:8]
-
-# ── Sidebar: API Health ───────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("### 🔍 API Status")
-    try:
-        health = requests.get(f"{API_BASE}/health/", timeout=3).json()
-        status_color = "ok" if health["status"] == "ok" else "err"
-        st.markdown(f"**Status:** <span style='color:{'green' if status_color=='ok' else 'red'};font-weight:bold'>{health['status'].upper()}</span>", unsafe_allow_html=True)
-        
-        if health.get("duckdb"):
-            st.success("✅ DuckDB connected")
-        else:
-            st.error("❌ DuckDB disconnected")
-        
-        if health.get("llm"):
-            st.success("✅ LLM ready")
-        else:
-            st.error("❌ LLM not ready")
-        
-        if health.get("tables"):
-            non_sys = [t for t in health["tables"] if t != "chat_history"]
-            if non_sys:
-                st.markdown("**📊 Loaded tables:**")
-                for t in non_sys:
-                    cnt = health.get("row_counts", {}).get(t, "?")
-                    st.caption(f"📋 `{t}` — {cnt:,} rows" if isinstance(cnt, int) else f"📋 `{t}`")
-    except Exception as e:
-        st.error(f"🔌 API unreachable: {e}")
-    
-    st.divider()
-    st.caption(f"Session: `{st.session_state.session_id}`")
-    if st.button("🗑 Clear session"):
-        for k in list(st.session_state.keys()):
-            if k not in ["session_id"]:
-                del st.session_state[k]
-        st.rerun()
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def _pills(**kwargs) -> str:
-    return "<div class='stat-row'>" + "".join(f"<div class='stat-pill'>{k}<span>{v}</span></div>" for k,v in kwargs.items()) + "</div>"
-
-def _render_log(log: List[str], title: str = "Log"):
-    if not log:
-        st.caption("No log entries.")
-        return
-    html = "".join(f"<div>{l}</div>" for l in log)
-    st.markdown(f"<div style='background:#f8f9fb;border:1px solid #e2e6ea;border-left:3px solid #2563eb;border-radius:0 6px 6px 0;padding:.7rem 1rem;max-height:280px;overflow-y:auto;font-family:monospace;font-size:.72rem'>{html}</div>", unsafe_allow_html=True)
-
-# ── Header ────────────────────────────────────────────────────────────────────
-st.title("HybridTableRAG")
-st.caption("Upload → Clean → Normalize → Load → Query  |  Debug always visible")
-st.divider()
-
-# ── 1. UPLOAD ─────────────────────────────────────────────────────────────────
-st.markdown("<div style='font-family:monospace;font-size:.8rem;font-weight:600;color:#2563eb;text-transform:uppercase;letter-spacing:.08em;margin:.8rem 0 .3rem'>① Upload Files</div>", unsafe_allow_html=True)
-
-uploaded_files = st.file_uploader(
-    "Drop CSV or Excel files (multiple supported)",
-    type=["csv", "xlsx", "xls"],
-    accept_multiple_files=True,
-    label_visibility="collapsed",
+# ── User Inputs
+header_rows = st.number_input(
+    "Header row count (0-indexed, e.g., 0=1 header, 1=2 headers)",
+    min_value=0, max_value=5, value=0
 )
+uploaded_file = st.file_uploader("Upload CSV/Excel file", type=["csv", "xlsx"])
 
-if uploaded_files:
-    for uf in uploaded_files:
-        if uf.name not in [f["name"] for f in st.session_state.upload_queue]:
-            content = uf.read()
-            # Preview sheets
-            sheets_preview = {}
-            if uf.name.lower().endswith((".xlsx", ".xls")):
-                try:
-                    xls = pd.ExcelFile(io.BytesIO(content))
-                    for sn in xls.sheet_names:
-                        sheets_preview[sn] = pd.read_excel(xls, sheet_name=sn, nrows=3)
-                except Exception as e:
-                    st.warning(f"Could not preview {uf.name}: {e}")
-            else:
-                sheets_preview["__default__"] = pd.read_csv(io.BytesIO(content), nrows=3)
-            
-            st.session_state.upload_queue.append({
-                "name": uf.name,
-                "bytes": content,
-                "sheets_preview": sheets_preview,
-                "size_kb": len(content) // 1024,
-            })
-            st.success(f"✅ Added `{uf.name}` ({len(sheets_preview)} sheet(s))")
+# ── Session state for persistence
+if "cleaned_sheets" not in st.session_state:
+    st.session_state.cleaned_sheets = {}
+if "plans" not in st.session_state:
+    st.session_state.plans = {}
+if "store" not in st.session_state:
+    st.session_state.store = None
+if "vector_store" not in st.session_state:
+    st.session_state.vector_store = None
+if "all_tables" not in st.session_state:
+    st.session_state.all_tables = {}
+if "llm" not in st.session_state:
+    st.session_state.llm = None
+if "logs" not in st.session_state:
+    st.session_state.logs = {
+        "cleaning": {},
+        "normalization": {},
+        "embedding": [],
+        "query": []
+    }
 
-if st.session_state.upload_queue:
-    st.markdown("**Upload Queue:**")
-    for item in st.session_state.upload_queue:
-        with st.expander(f"📄 {item['name']} ({item['size_kb']}KB)", expanded=False):
-            for sn, df in item["sheets_preview"].items():
-                st.caption(f"Sheet: `{sn}`")
-                st.dataframe(df, use_container_width=True, height=100)
-    
-    col_clear, col_process = st.columns([1, 4])
-    with col_clear:
-        if st.button("🗑 Clear"):
-            st.session_state.upload_queue = []
-            st.rerun()
-    with col_process:
-        run_ingest = st.button("▶ Send to API /ingest", type="primary", use_container_width=True, disabled=not st.session_state.upload_queue)
-else:
-    st.info("Upload files to begin.")
+# ── Step 1: File Upload & Cleaning
+if uploaded_file and st.button("Step 1: Load & Clean File"):
+    st.subheader("Step 1: File Upload & Cleaning")
+    sheets = read_file(uploaded_file, header_rows=list(range(header_rows + 1)))
+    st.session_state.logs["cleaning"] = {}
+    for name, df in sheets.items():
+        cleaned, log = clean_dataframe(df, log=[])
+        st.session_state.cleaned_sheets[name] = cleaned
+        st.session_state.logs["cleaning"][name] = log
 
-st.divider()
+# Display all cleaning logs
+st.subheader("Cleaning Logs")
+for name, log in st.session_state.logs["cleaning"].items():
+    st.markdown(f"**Sheet: {name}**")
+    st.text("\n".join(log))
+    st.dataframe(st.session_state.cleaned_sheets[name].head(5))
 
-# ── 2. CALL API /ingest ───────────────────────────────────────────────────────
-st.markdown("<div style='font-family:monospace;font-size:.8rem;font-weight:600;color:#2563eb;text-transform:uppercase;letter-spacing:.08em;margin:.8rem 0 .3rem'>② Process via API</div>", unsafe_allow_html=True)
+# ── Step 2: Normalization & DuckDB Registration
+if st.session_state.cleaned_sheets and st.button("Step 2: Normalize & Register"):
+    st.subheader("Step 2: Normalization & DuckDB Registration")
+    DB_PATH = "data/hybridtablerag_streamlit.duckdb"
+    os.makedirs(Path(DB_PATH).parent, exist_ok=True)
+    store = DuckDBStore(db_path=DB_PATH)
+    st.session_state.store = store
+    st.success(f"DuckDB initialized at {DB_PATH}")
 
-if run_ingest and st.session_state.upload_queue:
-    with st.spinner("📤 Sending files to API /ingest endpoint…"):
+    if not st.session_state.llm:
+        st.session_state.llm = get_llm()
+
+    normalizer = Normalizer(llm=st.session_state.llm)
+    st.session_state.logs["normalization"] = {}
+
+    for name, df in st.session_state.cleaned_sheets.items():
+        st.markdown(f"**Normalizing: {name}**")
         try:
-            # Prepare multipart form for FIRST file (API currently handles one file at a time)
-            first_file = st.session_state.upload_queue[0]
-            files = {"file": (first_file["name"], io.BytesIO(first_file["bytes"]), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
-            
-            form_data = {
-                "table_name": first_file["name"].replace(".xlsx", "").replace(".csv", ""),
-                "normalize": "true",
-                "header_rows": "",  # auto-detect
-                "sheet_name": "",   # all sheets
-            }
-            
-            resp = requests.post(f"{API_BASE}/ingest/", files=files, data=form_data, timeout=180)
-            
-            if resp.status_code != 200:
-                st.error(f"❌ API Error {resp.status_code}")
-                st.code(resp.text)
-                st.stop()
-            
-            result = resp.json()
-            st.session_state.api_ingest_result = result
-            
-            if result.get("success"):
-                st.success(f"✅ Ingest complete: {result['row_count']:,} rows in `{result['table_name']}`")
-                st.markdown(_pills(
-                    rows=f"{result['row_count']:,}",
-                    cols=result["column_count"],
-                    tables=len(result["tables_created"]),
-                    bridges=len(result["bridge_tables"]),
-                ), unsafe_allow_html=True)
-            else:
-                st.error(f"❌ Ingest failed: {result.get('error', 'Unknown')}")
-                
-        except requests.exceptions.ConnectionError:
-            st.error("🔌 Cannot connect to API. Is it running at `http://localhost:8000`?")
+            plan = normalizer.normalize(df, table_hint=name.replace(" ", "_").lower(), profile_hints={}, log=[])
+            st.session_state.plans[name] = plan
+            st.session_state.logs["normalization"][name] = plan.log if hasattr(plan, "log") else []
+
+            store.register_normalization_plan(plan, [])
+            st.success(f"Registered {plan.main_table_name} ({len(plan.bridge_tables)} bridge tables)")
         except Exception as e:
-            st.error(f"❌ Error: {e}")
-            import traceback
-            st.code(traceback.format_exc())
+            st.session_state.logs["normalization"][name] = [str(e)]
 
-# Show API ingest result
-if st.session_state.api_ingest_result:
-    r = st.session_state.api_ingest_result
-    
-    with st.expander("📋 Full API Response", expanded=True):
-        st.json(r)
-    
-    # Logs
-    col_l, col_r = st.columns(2)
-    with col_l:
-        with st.expander("🧹 Cleaning Log", expanded=False):
-            _render_log(r.get("cleaning_log", []))
-    with col_r:
-        with st.expander("🔀 Normalization Log", expanded=False):
-            _render_log(r.get("norm_log", []))
-    
-    # Bridge tables
-    if r.get("bridge_tables"):
-        st.markdown("**🔗 Bridge tables created:**")
-        for bt in r["bridge_tables"]:
-            st.markdown(
-                f"<div style='background:#f7f8fa;border:1px solid #e2e6ea;border-radius:8px;padding:.8rem;margin:.4rem 0'>"
-                f"<strong>📋 {bt['name']}</strong><br/>"
-                f"<small>{bt['row_count']:,} rows | cols: {', '.join(bt['columns'])} | from: <code>{bt['source_col']}</code></small>"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-    
-    # Relationships
-    if r.get("relationships"):
-        with st.expander("🔗 Relationships", expanded=True):
-            for rel in r["relationships"]:
-                st.caption(f"`{rel['from_table']}.{rel['from_column']}` → `{rel['to_table']}.{rel['to_column']}` ({rel.get('type','')})")
+# Display all normalization logs and table previews
+st.subheader("Normalization Logs")
+for name, log in st.session_state.logs["normalization"].items():
+    st.markdown(f"**Table: {name}**")
+    st.text("\n".join(log))
+    plan = st.session_state.plans.get(name)
+    if plan:
+        st.dataframe(plan.main_df.head(5))
+        for bt in plan.bridge_tables:
+            st.markdown(f"Bridge Table: {bt.name}")
+            st.dataframe(bt.df.head(5))
 
-st.divider()
+# ── Step 3: Vector Embedding
+if st.session_state.plans and st.button("Step 3: Vector Embedding"):
+    st.header("Step 3: Vector Embedding")
+    provider = get_embedding_provider()
+    vector_store = VectorStore(st.session_state.store.conn, provider)
+    vector_store.setup()
+    st.session_state.vector_store = vector_store
+    st.success(f"VectorStore ready (dim: {provider.dimension})")
 
-# ── 3. QUICK TEST QUERY ───────────────────────────────────────────────────────
-st.markdown("<div style='font-family:monospace;font-size:.8rem;font-weight:600;color:#2563eb;text-transform:uppercase;letter-spacing:.08em;margin:.8rem 0 .3rem'>③ Quick Test Query</div>", unsafe_allow_html=True)
+    bts_log = []
 
-if st.session_state.api_ingest_result and st.session_state.api_ingest_result.get("success"):
-    query = st.text_input("Ask a question", placeholder='e.g. "How many rows?" or "Find tickets about login"')
-    
-    col_opts, col_run = st.columns([3, 1])
-    with col_opts:
-        force_intent = st.selectbox("Force intent", ["auto", "sql", "python", "vector", "conversational"])
-        top_k = st.slider("Vector top-K", 3, 20, 10)
-    
-    if col_run.button("▶ Run Query") and query:
-        with st.spinner("🤔 Querying…"):
-            try:
-                resp = requests.post(
-                    f"{API_BASE}/query/",
-                    json={
-                        "query": query,
-                        "session_id": st.session_state.session_id,
-                        "reasoning": True,
-                        "debug_mode": True,
-                        "force_intent": None if force_intent == "auto" else force_intent,
-                        "top_k_vector": top_k,
-                    },
-                    timeout=90,
-                )
-                qr = resp.json()
-            except Exception as e:
-                qr = {"success": False, "error": f"API error: {e}", "intent": "error", "bts_log": []}
-        
-        # Render result
-        if not qr.get("success"):
-            st.error(f"❌ {qr.get('error', 'Unknown error')}")
-        else:
-            st.caption(f"🎯 Intent: `{qr['intent'].upper()}`")
-            
-            if qr.get("rows"):
-                st.dataframe(pd.DataFrame(qr["rows"]), use_container_width=True)
-            if qr.get("chart_json"):
-                import plotly.io as pio
-                fig = pio.from_json(qr["chart_json"])
-                st.plotly_chart(fig, use_container_width=True, key=f"quick_{uuid.uuid4().hex[:6]}")
-            if qr.get("vector_results"):
-                st.dataframe(pd.DataFrame(qr["vector_results"]), use_container_width=True)
-            if qr.get("llm_answer"):
-                st.info(qr["llm_answer"])
-            
-            # Debug panel (always visible)
-            with st.expander("🔍 Debug Details", expanded=True):
-                if qr.get("sql"):
-                    st.markdown("**Generated SQL:**")
-                    st.code(qr["sql"], language="sql")
-                if qr.get("python_code"):
-                    st.markdown("**Generated Python:**")
-                    st.code(qr["python_code"], language="python")
-                if qr.get("context_used"):
-                    st.markdown("**Context Injected:**")
-                    st.caption(qr["context_used"])
-                if qr.get("bts_log"):
-                    _render_log(qr["bts_log"], "Execution Log")
-else:
-    st.info("Complete ingest in step ② to enable queries.")
+    all_tables = {}
+    for plan in st.session_state.plans.values():
+        all_tables[plan.main_table_name] = plan.main_df
+        for bt in plan.bridge_tables:
+            all_tables[bt.name] = bt.df
+    st.session_state.all_tables = all_tables
 
-st.divider()
+    st.subheader("Tables to process:")
+    st.write(list(all_tables.keys()))
 
-# ── 4. DOWNLOAD ───────────────────────────────────────────────────────────────
-st.markdown("<div style='font-family:monospace;font-size:.8rem;font-weight:600;color:#2563eb;text-transform:uppercase;letter-spacing:.08em;margin:.8rem 0 .3rem'>④ Download</div>", unsafe_allow_html=True)
-
-if st.session_state.api_ingest_result and st.session_state.api_ingest_result.get("success"):
-    for tbl in st.session_state.api_ingest_result.get("tables_created", []):
+    def is_semantic_column(store, table_name, col):
         try:
-            resp = requests.post(
-                f"{API_BASE}/query/",
-                json={"query": f"SELECT * FROM {tbl} LIMIT 100", "session_id": st.session_state.session_id, "force_intent": "sql"},
-                timeout=30,
-            ).json()
-            if resp.get("rows"):
-                df = pd.DataFrame(resp["rows"])
-                csv = df.to_csv(index=False).encode()
-                st.download_button(f"⬇️ {tbl}.csv", data=csv, file_name=f"{tbl}.csv", mime="text/csv", key=f"dl_{tbl}")
-        except Exception:
-            st.caption(f"⚠️ Could not prepare `{tbl}`")
-else:
-    st.info("No data loaded yet.")
+            if table_name not in store.list_tables():
+                return False
+            rows = store.conn.execute(
+                f'SELECT "{col}" FROM "{table_name}" WHERE "{col}" IS NOT NULL LIMIT 50'
+            ).fetchall()
+            values = [str(r[0]) for r in rows if r[0] is not None]
+            if not values:
+                return False
+            total_chars = sum(len(v) for v in values)
+            alpha_chars = sum(sum(c.isalpha() for c in v) for v in values)
+            alpha_ratio = alpha_chars / total_chars if total_chars else 0
+            avg_token_len = sum(len(v.split()) for v in values) / len(values)
+            distinct = store.conn.execute(f'SELECT COUNT(DISTINCT "{col}") FROM "{table_name}"').fetchone()[0]
+            if alpha_ratio > 0.5 and avg_token_len >= 1:
+                return True
+            if distinct < 50 and alpha_ratio > 0.6:
+                return True
+            return False
+        except Exception as e:
+            bts_log.append(f"Semantic check failed for {table_name}.{col}: {e}")
+            return False
+
+    for table_name in all_tables.keys():
+        if table_name not in st.session_state.store.list_tables():
+            st.warning(f"Skipping {table_name}: table not registered in DuckDB")
+            continue
+
+        st.write(f"Processing table: {table_name}")
+        schema = st.session_state.store.get_table_schema(table_name)
+        pk_column = next((c["column_name"] for c in schema if c["column_name"].endswith("_id")), None)
+        if not pk_column:
+            st.warning(f"No PK found for {table_name}, generating surrogate PK")
+            st.session_state.store.conn.execute(
+                f'ALTER TABLE "{table_name}" ADD COLUMN row_id INTEGER GENERATED ALWAYS AS IDENTITY'
+            )
+            pk_column = "row_id"
+
+        text_cols = [
+            c["column_name"]
+            for c in schema
+            if c["data_type"] in ("VARCHAR", "TEXT") and c["column_name"] != pk_column and
+            is_semantic_column(st.session_state.store, table_name, c["column_name"])
+        ]
+
+        if not text_cols:
+            st.info(f"No semantic text columns found for {table_name}, skipping embedding")
+            continue
+
+        vector_store.embed_table(table_name=table_name, text_columns=text_cols, pk_column=pk_column, bts_log=bts_log)
+        st.success(f"Embedded table {table_name} with columns: {text_cols}")
+
+    st.session_state.logs["embedding"].extend(bts_log)
+    with st.expander("Vector Embedding Logs", expanded=True):
+        st.text("\n".join(st.session_state.logs["embedding"]) if st.session_state.logs["embedding"] else "No logs. All embeddings completed successfully.")
+# ── Step 4: Query
+if st.session_state.all_tables:
+    st.subheader("Step 4: Query Interface")
+    
+    # Build schema context once
+    schema_ctx = build_multi_table_schema_context(
+        st.session_state.store.conn,
+        list(st.session_state.all_tables.keys()),
+        relationships=[], bts_log=[]
+    )
+    schema_summary = format_schema_for_prompt(schema_ctx)
+
+    intent = IntentClassifier(st.session_state.llm)
+    sql_gen = LLMSQLGenerator(st.session_state.llm)
+    orchestrator = QueryOrchestrator(
+        llm=st.session_state.llm,
+        store=st.session_state.store,
+        context_store=None,
+        sql_generator=sql_gen,
+        table_names=list(st.session_state.all_tables.keys()),
+        relationships=[],
+        vector_store=st.session_state.vector_store,
+        default_table=list(st.session_state.all_tables.keys())[0],
+    )
+
+    # Persistent user query
+    if "user_query" not in st.session_state:
+        st.session_state.user_query = "show ticket count by status"
+
+    st.session_state.user_query = st.text_input(
+        "Enter your query here", 
+        value=st.session_state.user_query, 
+        key="query_input"
+    )
+
+    # Execute query on button click
+    if st.button("Execute Query"):
+        if st.session_state.user_query.strip():
+            result = orchestrator.run(
+                user_query=st.session_state.user_query,
+                session_id="streamlit_session",
+                debug_mode=True
+            )
+            st.session_state.logs["query"].append(result)
+
+# Display all previous queries and results
+if st.session_state.logs["query"]:
+    st.subheader("Query History")
+    for i, res in enumerate(st.session_state.logs["query"]):
+        st.markdown(f"**Query {i+1}:** {st.session_state.user_query if i == len(st.session_state.logs['query'])-1 else ''}")
+        st.write("Intent:", getattr(res, "intent", ""))
+        st.write("SQL:", getattr(res, "sql", ""))
+        if getattr(res, "dataframe", None) is not None:
+            st.dataframe(res.dataframe)
+        if getattr(res, "error", None):
+            st.error(res.error)
+        if getattr(res, "bts_log", None):
+            st.text("\n".join(res.bts_log))
