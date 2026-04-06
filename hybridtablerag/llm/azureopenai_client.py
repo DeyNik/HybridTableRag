@@ -35,7 +35,6 @@ class AzureOpenAIClient(BaseLLM):
     def generate(self, prompt: str) -> str:
         response = self.client.chat.completions.create(
             model=self.deployment_name,   # Azure uses deployment name here, not model name
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
+            messages=[{"role": "user", "content": prompt}]
         )
         return response.choices[0].message.content.strip()

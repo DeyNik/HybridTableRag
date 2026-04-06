@@ -13,8 +13,6 @@ import json
 import re
 import warnings
 from typing import Dict, List, Optional, Tuple
-import os
-import hashlib
 import pandas as pd
 
 
@@ -77,12 +75,25 @@ def _merge_multi_level_headers(df: pd.DataFrame, header_rows: list[int]) -> pd.D
 
 
 # File I/O
+from typing import Optional, List, Dict
+import pandas as pd
 
 def read_file(
     filepath_or_buffer,
     header_rows: Optional[List[int]] = None,
     sheet_name: Optional[str] = None,
 ) -> Dict[str, pd.DataFrame]:
+
+    def _merge_multi_level_headers(df_raw: pd.DataFrame, header_rows: List[int]) -> pd.DataFrame:
+        # Only use the specified header_rows to form column names
+        columns = [
+            "_".join(map(str, df_raw.iloc[header_rows, i].values)).strip()
+            for i in range(df_raw.shape[1])
+        ]
+        df_raw.columns = columns
+        # Drop the header rows from data
+        df = df_raw.drop(header_rows).reset_index(drop=True)
+        return df
 
     if hasattr(filepath_or_buffer, 'name'):
         name = filepath_or_buffer.name
@@ -101,13 +112,15 @@ def read_file(
             else:
                 # Multi-level: read raw, then merge
                 df_raw = pd.read_excel(filepath_or_buffer, sheet_name=sheet_name or 0, header=None)
-                sheets = _merge_multi_level_headers(df_raw, header_rows)
-                if sheet_name and isinstance(sheets, dict) and sheet_name in sheets:
-                    sheets = {sheet_name: sheets[sheet_name]}
+                df_merged = _merge_multi_level_headers(df_raw, header_rows)
+                if sheet_name:
+                    sheets = {sheet_name: df_merged}
+                else:
+                    sheets = {'sheet': df_merged}
         else:
             # Default: single header
             sheets = pd.read_excel(filepath_or_buffer, sheet_name=sheet_name or None, header=0)
-        
+
         if isinstance(sheets, pd.DataFrame):
             return {sheet_name or 'sheet': sheets}
         return sheets
@@ -116,18 +129,15 @@ def read_file(
         # CSV handling
         if header_rows is not None:
             if len(header_rows) == 1:
-                # Single header: let pandas handle it
                 df = pd.read_csv(filepath_or_buffer, header=header_rows[0])
             else:
-                # Multi-level: read raw, then merge headers manually
                 df_raw = pd.read_csv(filepath_or_buffer, header=None)
                 df = _merge_multi_level_headers(df_raw, header_rows)
             return {'sheet': df}
-        
+
         # Default: single header at row 0
         return {'sheet': pd.read_csv(filepath_or_buffer, header=0)}
-
-
+    
 # JSON helpers
 
 def _flatten_dict(d: dict, prefix: str, sep: str = '_') -> dict:
@@ -140,15 +150,15 @@ def _flatten_dict(d: dict, prefix: str, sep: str = '_') -> dict:
             out[new_key] = v
     return out
 
-def _parse_json(val):
-    if isinstance(val, str):
-        stripped = val.strip()
-        if stripped.startswith(('{', '[')):
-            try:
-                return json.loads(stripped)
-            except json.JSONDecodeError:
-                pass
-    return val
+# def _parse_json(val):
+#     if isinstance(val, str):
+#         stripped = val.strip()
+#         if stripped.startswith(('{', '[')):
+#             try:
+#                 return json.loads(stripped)
+#             except json.JSONDecodeError:
+#                 pass
+#     return val
 
 def _is_json_column(series: pd.Series) -> bool:
     import json as _json
@@ -168,47 +178,47 @@ def _is_json_column(series: pd.Series) -> bool:
                 pass
     return False
 
-def flatten_json_column(df: pd.DataFrame, col: str, prefix: str = None, log: Optional[List[str]] = None) -> pd.DataFrame:
-    log = log or []
-    prefix = prefix or col
-    row_records: List[Optional[dict]] = []
+# def flatten_json_column(df: pd.DataFrame, col: str, prefix: str = None, log: Optional[List[str]] = None) -> pd.DataFrame:
+#     log = log or []
+#     prefix = prefix or col
+#     row_records: List[Optional[dict]] = []
 
-    for val in df[col]:
-        if val is None or (isinstance(val, float) and pd.isna(val)):
-            row_records.append(None)
-            continue
+#     for val in df[col]:
+#         if val is None or (isinstance(val, float) and pd.isna(val)):
+#             row_records.append(None)
+#             continue
 
-        parsed = _parse_json(val)
+#         parsed = _parse_json(val)
 
-        if isinstance(parsed, dict):
-            row_records.append(_flatten_dict(parsed, prefix))
-        elif isinstance(parsed, list):
-            if not parsed:
-                row_records.append(None)
-            elif all(isinstance(x, dict) for x in parsed):
-                keys = set().union(*(d.keys() for d in parsed))
-                merged = {f"{prefix}_{k}": '; '.join(str(d.get(k, '')) for d in parsed) for k in keys}
-                row_records.append(merged)
-            else:
-                row_records.append({prefix: '; '.join(str(x) for x in parsed)})
-        else:
-            row_records.append({prefix: parsed})
+#         if isinstance(parsed, dict):
+#             row_records.append(_flatten_dict(parsed, prefix))
+#         elif isinstance(parsed, list):
+#             if not parsed:
+#                 row_records.append(None)
+#             elif all(isinstance(x, dict) for x in parsed):
+#                 keys = set().union(*(d.keys() for d in parsed))
+#                 merged = {f"{prefix}_{k}": '; '.join(str(d.get(k, '')) for d in parsed) for k in keys}
+#                 row_records.append(merged)
+#             else:
+#                 row_records.append({prefix: '; '.join(str(x) for x in parsed)})
+#         else:
+#             row_records.append({prefix: parsed})
 
-    seen, all_keys = set(), []
-    for rec in row_records:
-        if rec:
-            for k in rec:
-                if k not in seen:
-                    all_keys.append(k)
-                    seen.add(k)
+#     seen, all_keys = set(), []
+#     for rec in row_records:
+#         if rec:
+#             for k in rec:
+#                 if k not in seen:
+#                     all_keys.append(k)
+#                     seen.add(k)
 
-    for k in all_keys:
-        df[k] = [rec.get(k) if rec else None for rec in row_records]
-        log.append(f"Flattened '{col}' -> '{k}'")
+#     for k in all_keys:
+#         df[k] = [rec.get(k) if rec else None for rec in row_records]
+#         log.append(f"Flattened '{col}' -> '{k}'")
 
-    df = df.drop(columns=[col])
-    log.append(f"Dropped original JSON column '{col}'")
-    return df
+#     df = df.drop(columns=[col])
+#     log.append(f"Dropped original JSON column '{col}'")
+#     return df
 
 
 # Null / date cleaning
@@ -261,6 +271,7 @@ def clean_dataframe(
 
     log = log or []
 
+    #flatten multiindex columns
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = ['_'.join(str(i) for i in col if str(i).strip()).strip() for col in df.columns]
         log.append('Flattened pandas MultiIndex columns')
@@ -268,15 +279,18 @@ def clean_dataframe(
     original_cols = df.columns.tolist()
     df.columns = [normalize_column_name(c) for c in df.columns]
 
+    #normalize col names
     renamed = {o: n for o, n in zip(original_cols, df.columns) if str(o) != n}
     if renamed:
         log.append(f'Normalised column names: {renamed}')
 
+    #drop duplicate col name
     dupes = df.columns[df.columns.duplicated()].tolist()
     if dupes:
         df = df.loc[:, ~df.columns.duplicated()]
         log.append(f'Dropped duplicate column names: {dupes}')
 
+    #drop content duplicate column
     seen_fingerprints: dict = {}
     content_dupes = []
 
@@ -292,21 +306,27 @@ def clean_dataframe(
         for dup, orig in content_dupes:
             log.append(f"Dropped content-duplicate '{dup}' (identical to '{orig}')")
 
+    #cell cleaning
     for col in df.columns:
         df[col] = df[col].apply(clean_column_value)
 
     log.append('Applied cell cleaning')
 
+    #drop duplicate rows
     n_before = len(df)
     df = df.drop_duplicates().reset_index(drop=True)
 
     if n_before != len(df):
         log.append(f'Dropped {n_before - len(df)} duplicate row(s)')
 
+
+    #IMPORTANT : detect JSON and List columns and avoid flattening so that normalizer picks it
     for col in df.columns.tolist():
         if _is_json_column(df[col]):
-            df = flatten_json_column(df, col, prefix=col, log=log)
+            pass
+            #df = flatten_json_column(df, col, prefix=col, log=log)
 
+    #normalize date and numeric patterns
     date_pattern = re.compile(r'(\d{1,4}[-/\.]\d{1,2}[-/\.]\d{1,4})|(\d{1,2}\s?[A-Za-z]{3,9}\s?\d{2,4})|([A-Za-z]{3,9}\s?\d{1,2},?\s?\d{2,4})')
 
     for col in df.columns:

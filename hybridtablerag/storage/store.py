@@ -18,6 +18,12 @@ class DuckDBStore:
     """
 
     def __init__(self, db_path: str = "data/hybridtablerag.duckdb"):
+        if db_path == ":memory:":
+            self.db_path = ":memory:"
+            self.conn = duckdb.connect(":memory:")
+            return
+
+        # Normal file path handling
         project_root = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "../../")
         )

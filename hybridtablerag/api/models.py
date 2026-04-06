@@ -90,7 +90,7 @@ class QueryResponse(BaseModel):
     # Meta
     reasoning:        Optional[str]         = None
     context_used:     Optional[str]         = None
-    bts_log:          List[str]             = []
+    bts_log:          List[str]             = Field(default_factory=list)
     debug_info:       Optional[Dict]        = None
     error:            Optional[str]         = None
     python_error:     Optional[str]         = None
